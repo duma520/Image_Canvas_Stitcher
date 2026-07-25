@@ -1,4 +1,9 @@
-好的，遵照您的要求，我为您编写一份从零基础到高级应用的、详尽全面的《图片自由拼接工具 - Image Canvas Stitcher》使用说明书。
+# 软件截图
+
+v3.0 版截图
+
+<img width="1474" height="956" alt="image" src="https://github.com/user-attachments/assets/78582b67-6696-4253-9805-36a971ba5cab" />
+
 
 ---
 
