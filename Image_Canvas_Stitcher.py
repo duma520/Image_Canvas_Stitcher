@@ -35,19 +35,100 @@ from PySide6.QtCore import Qt, QPointF, QRectF, QSizeF, QTimer, QSize
 from PySide6.QtGui import QKeySequence
 
 # ==================== 配置常量 ====================
-APP_DATA_DIR = os.path.join(os.path.expanduser("~"), ".image_stitcher")
-AUTOSAVE_DIR = os.path.join(APP_DATA_DIR, "autosave")
-HISTORY_DIR = os.path.join(APP_DATA_DIR, "history")
+# 自动保存和历史记录都保存在程序所在目录的子目录下，方便管理
+PROGRAM_DIR = os.path.dirname(os.path.abspath(__file__))
+AUTOSAVE_DIR = os.path.join(PROGRAM_DIR, "autosave")
+HISTORY_DIR = os.path.join(PROGRAM_DIR, "history")
 AUTOSAVE_DELAY_MS = 1500  # 自动保存防抖延迟
 MAX_HISTORY_ITEMS = 50    # 最多保存历史记录数
 
 
 def ensure_dirs():
     """确保数据目录存在"""
-    for d in [APP_DATA_DIR, AUTOSAVE_DIR, HISTORY_DIR,
+    for d in [AUTOSAVE_DIR, HISTORY_DIR,
               os.path.join(AUTOSAVE_DIR, "images"),
               os.path.join(HISTORY_DIR, "images")]:
         os.makedirs(d, exist_ok=True)
+
+
+# ==================== 项目信息元数据 ====================
+class ProjectInfo:
+    """项目信息元数据（集中管理所有项目相关信息）"""
+    # ----- 基本信息 -----
+    NAME = "Image Canvas Stitcher"
+    DISPLAY_NAME = "图片自由拼接工具"
+    VERSION = "3.3"
+    BUILD_DATE = "2026-07-25"
+    
+    # ----- 作者信息 -----
+    AUTHOR = "杜玛"
+    COPYRIGHT = "© 永久 杜玛"
+    LICENSE = "MIT"
+    
+    # ----- 联系方式 -----
+    URL = "https://github.com/duma520/IntervalTracker"
+    MAINTAINER_EMAIL = "不提供"
+    
+    # ----- 程序描述 -----
+    DESCRIPTION = "图片自由拼接工具 - 支持拖拽、粘贴、缩放、透明度调整、差异比对、历史记录"
+    
+    # ----- 窗口标题格式 -----
+    TITLE_FORMAT = "{display_name} v{version}"
+    TITLE_FORMAT_WITH_USER = "{display_name} v{version} - 当前用户: {username}"
+    
+    @classmethod
+    def get_full_name(cls) -> str:
+        """获取完整的程序名称（带版本）"""
+        return f"{cls.NAME} v{cls.VERSION}"
+    
+    @classmethod
+    def get_display_full_name(cls) -> str:
+        """获取显示用完整名称（中文名 + 版本）"""
+        return f"{cls.DISPLAY_NAME} v{cls.VERSION}"
+    
+    @classmethod
+    def get_window_title(cls, username: str = None) -> str:
+        """获取窗口标题"""
+        if username:
+            return cls.TITLE_FORMAT_WITH_USER.format(
+                display_name=cls.DISPLAY_NAME,
+                version=cls.VERSION,
+                username=username
+            )
+        return cls.TITLE_FORMAT.format(
+            display_name=cls.DISPLAY_NAME,
+            version=cls.VERSION
+        )
+    
+    @classmethod
+    def get_about_text(cls) -> str:
+        """获取关于信息文本（HTML格式）"""
+        return f"""
+        <h2>{cls.DISPLAY_NAME}</h2>
+        <p><b>英文名:</b> {cls.NAME}</p>
+        <p><b>版本:</b> {cls.VERSION}</p>
+        <p><b>构建日期:</b> {cls.BUILD_DATE}</p>
+        <p><b>作者:</b> {cls.AUTHOR}</p>
+        <p><b>版权:</b> {cls.COPYRIGHT}</p>
+        <p><b>许可证:</b> {cls.LICENSE}</p>
+        <p><b>项目主页:</b> <a href='{cls.URL}'>{cls.URL}</a></p>
+        <p><b>维护者邮箱:</b> {cls.MAINTAINER_EMAIL}</p>
+        <p><b>描述:</b> {cls.DESCRIPTION}</p>
+        """
+    
+    @classmethod
+    def get_status_tip(cls) -> str:
+        """获取状态栏提示信息"""
+        return (
+            "提示：Ctrl+V粘贴 | 拖拽文件导入 | 左键拖动图片 | "
+            "Ctrl+滚轮缩放视图 | 选中后滚轮缩放图片 | "
+            "空格+左键/中键平移 | 右键菜单"
+        )
+    
+    @classmethod
+    def get_export_default_filename(cls) -> str:
+        """获取导出默认文件名"""
+        return f"stitched_image_{time.strftime('%Y%m%d_%H%M%S')}.png"
 
 
 # ==================== 可移动图片图元 ====================
@@ -767,7 +848,8 @@ class HistoryManager:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("图片自由拼接工具 - Image Canvas Stitcher (PySide6)")
+        # 使用 ProjectInfo 统一设置窗口标题
+        self.setWindowTitle(ProjectInfo.get_window_title())
         self.resize(1200, 800)
         self._set_app_icon()
         # 管理器
@@ -912,11 +994,7 @@ class MainWindow(QMainWindow):
     def _build_statusbar(self):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_label = QLabel(
-            "提示：Ctrl+V粘贴 | 拖拽文件导入 | 左键拖动图片 | "
-            "Ctrl+滚轮缩放视图 | 选中后滚轮缩放图片 | "
-            "空格+左键/中键平移 | 右键菜单"
-        )
+        self.status_label = QLabel(ProjectInfo.get_status_tip())
         self.status_bar.addWidget(self.status_label, 1)
         self.view_zoom_label = QLabel("视图: 100%")
         self.view_zoom_label.setStyleSheet("padding: 0 10px; color: #888;")
@@ -942,11 +1020,7 @@ class MainWindow(QMainWindow):
             self.sld_item_opacity.blockSignals(False)
             self.lbl_item_opacity.setText(f"{int(item.opacity_value() * 100)}%")
         else:
-            self.status_label.setText(
-                "提示：Ctrl+V粘贴 | 拖拽文件导入 | 左键拖动图片 | "
-                "Ctrl+滚轮缩放视图 | 选中后滚轮缩放图片 | "
-                "空格+左键/中键平移 | 右键菜单"
-            )
+            self.status_label.setText(ProjectInfo.get_status_tip())
 
     # ==================== 透明度 ====================
     def _on_item_opacity_slider(self, value):
@@ -1315,7 +1389,7 @@ class MainWindow(QMainWindow):
             painter.drawPixmap(x, y, item.pixmap())
         painter.end()
         save_path, _ = QFileDialog.getSaveFileName(
-            self, "导出拼接大图", "stitched_image.png",
+            self, "导出拼接大图", ProjectInfo.get_export_default_filename(),
             "PNG 图片 (支持透明) (*.png);;JPEG 图片 (*.jpg);;BMP 图片 (*.bmp)"
         )
         if not save_path:
