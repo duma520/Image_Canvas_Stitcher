@@ -1,8 +1,10 @@
 # 软件截图
 
-v3.0 版截图
+v3.3 版截图
 
-<img width="1474" height="956" alt="image" src="https://github.com/user-attachments/assets/78582b67-6696-4253-9805-36a971ba5cab" />
+<img width="1920" height="1040" alt="image" src="https://github.com/user-attachments/assets/a645d26d-d271-46d7-8c61-25dac1a60a84" />
+
+<img width="1202" height="832" alt="image" src="https://github.com/user-attachments/assets/b6f3296d-c4f5-4ad4-9118-a224421ba359" />
 
 
 ---
