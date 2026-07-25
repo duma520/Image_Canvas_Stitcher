@@ -6,6 +6,14 @@ v3.3 版截图
 
 <img width="1202" height="832" alt="image" src="https://github.com/user-attachments/assets/b6f3296d-c4f5-4ad4-9118-a224421ba359" />
 
+v3.5版截图
+
+<img width="1202" height="832" alt="image" src="https://github.com/user-attachments/assets/12e9e7dc-a4b3-426d-b6d0-3af4a6c8e96f" />
+
+<img width="1202" height="832" alt="image" src="https://github.com/user-attachments/assets/5f416376-c86e-42c3-b028-d6bdeaef6b37" />
+
+<img width="1202" height="832" alt="image" src="https://github.com/user-attachments/assets/45374883-7a69-40f5-821a-b2e6da1d7232" />
+
 
 ---
 
