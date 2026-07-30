@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 图片自由拼接工具 - Image Canvas Stitcher (PySide6 版本)
-版本: 3.34
+版本: 3.33
 功能：
 - 从剪贴板粘贴图片 (Ctrl+V)
 - 拖拽文件导入图片
@@ -21,8 +21,9 @@
 - 背景方案：纯色、网格、点阵、自定义图片
 - 40+种背景形状和图案
 - 在图片上画画做标记，并保存下来供下次使用
-- Emoji表情功能：Win+; 调出面板、右键/菜单添加、吸附锁定
-- 【新增 v3.34】Emoji独立文件保存，永久保留，彻底解决重开/加载历史位置错乱问题
+- 【新增 v3.33】Emoji表情功能：Win+; 调出面板、右键/菜单添加、吸附锁定
+- 【新增 v3.33】Emoji大小调整：右键菜单/滚轮缩放
+- 【新增 v3.33】Emoji随图片自动保存和恢复
 """
 import sys
 import os
@@ -30,7 +31,6 @@ import json
 import time
 import uuid
 import math
-import shutil
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsView, QGraphicsScene,
     QGraphicsPixmapItem, QGraphicsItem, QToolBar, QPushButton,
@@ -55,7 +55,6 @@ HISTORY_DIR = os.path.join(PROGRAM_DIR, "history")
 SETTINGS_FILE = os.path.join(PROGRAM_DIR, "settings.json")
 BACKGROUNDS_DIR = os.path.join(PROGRAM_DIR, "backgrounds")
 MARKERS_DIR = os.path.join(PROGRAM_DIR, "markers")
-EMOJIS_DIR = os.path.join(PROGRAM_DIR, "emojis")  # ✅ 新增 Emoji 独立存储目录
 
 # 背景形状类型 - 40+种
 BACKGROUND_SHAPES = [
@@ -182,7 +181,7 @@ DEFAULT_SETTINGS = {
     "performance_mode": "balanced",
     "antialiasing": True,
     "smooth_pixmap": True,
-    "recent_emojis": [],
+    "recent_emojis": [],  # 新增：最近使用的Emoji
     "toolbar_visibility": {
         "btn_import": True,
         "btn_paste": True,
@@ -210,14 +209,14 @@ DEFAULT_SETTINGS = {
         "btn_settings": True,
         "btn_marker": True,
         "btn_clear_markers": True,
-        "btn_emoji": True,
-        "btn_emoji_favorites": True,
+        "btn_emoji": True,  # 新增
+        "btn_emoji_favorites": True,  # 新增
     }
 }
 
 
 def ensure_dirs():
-    for d in [AUTOSAVE_DIR, HISTORY_DIR, BACKGROUNDS_DIR, MARKERS_DIR, EMOJIS_DIR,
+    for d in [AUTOSAVE_DIR, HISTORY_DIR, BACKGROUNDS_DIR, MARKERS_DIR,
               os.path.join(AUTOSAVE_DIR, "images"),
               os.path.join(HISTORY_DIR, "images"),
               os.path.join(MARKERS_DIR, "images")]:
@@ -1424,6 +1423,7 @@ class EmojiItem(QGraphicsPixmapItem):
         
         self._parent_image = None
         self._item_id = item_id or str(uuid.uuid4())[:8]
+        self._offset = QPointF(0, 0)  # 相对于父图片的偏移量
         self._scale_factor = 1.0  # 缩放因子
         
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
@@ -1474,60 +1474,38 @@ class EmojiItem(QGraphicsPixmapItem):
         return self._item_id
     
     def set_parent_image(self, parent_item, auto_calc_offset=True):
-        """
-        设置吸附的父图片
-        auto_calc_offset=True: 新建时自动计算相对于父图片中心的位置
-        auto_calc_offset=False: 从保存状态恢复，直接使用已存储的 pos()
-        """
         if parent_item:
-            # 如果之前有父图片，先解除关系
             if self._parent_image:
                 self._parent_image.remove_attached_emoji(self)
-            
             self._parent_image = parent_item
-            
             if auto_calc_offset:
-                # ✅ 新建时：计算相对于父图片中心的位置
-                parent_center = parent_item.boundingRect().center()
-                # 获取当前场景坐标
-                if self.scene() and parent_item.scene():
-                    scene_pos = self.scenePos()
-                    parent_scene_pos = parent_item.scenePos()
-                else:
-                    scene_pos = self.pos()
-                    parent_scene_pos = parent_item.pos()
-                
-                # 计算相对于父图片的位置
-                rel_pos = scene_pos - parent_scene_pos
-                self.setPos(rel_pos)
-            
-            # ✅ 设置为父图片的子项（坐标自动变为相对父图片）
+                parent_pos = parent_item.scenePos() if parent_item.scene() else parent_item.pos()
+                self._offset = self.scenePos() - parent_pos
             self.setParentItem(parent_item)
+            self.setPos(self._offset)
             self.setFlag(QGraphicsItem.ItemIsMovable, True)
 
     def restore_parent(self, parent_item):
-        """从保存状态恢复父项（不重新计算位置）"""
+        """从保存状态恢复父项（不重新计算偏移）"""
         if parent_item:
             if self._parent_image:
                 self._parent_image.remove_attached_emoji(self)
             self._parent_image = parent_item
-            # ✅ 直接设置父项，pos() 已经是相对父图片的坐标
             self.setParentItem(parent_item)
+            self.setPos(self._offset)
             self.setFlag(QGraphicsItem.ItemIsMovable, True)
 
     def get_parent_image(self):
         return self._parent_image
     
     def detach_from_parent(self):
-        """从父图片分离"""
         if self._parent_image:
             self._parent_image.remove_attached_emoji(self)
-            # ✅ 获取当前场景坐标
             scene_pos = self.scenePos()
             self.setParentItem(None)
-            # ✅ 设置为场景中的绝对坐标
             self.setPos(scene_pos)
             self._parent_image = None
+            self._offset = QPointF(0, 0)
             self.setFlag(QGraphicsItem.ItemIsMovable, True)
     
     def set_scale_factor(self, factor):
@@ -1542,7 +1520,6 @@ class EmojiItem(QGraphicsPixmapItem):
         self.setTransformOriginPoint(self.pixmap().width() / 2, self.pixmap().height() / 2)
     
     def scale_at(self, factor, scene_pos):
-        """在指定场景位置缩放"""
         new_factor = self._scale_factor * factor
         new_factor = max(0.2, min(new_factor, 5.0))
         if new_factor == self._scale_factor:
@@ -1557,8 +1534,11 @@ class EmojiItem(QGraphicsPixmapItem):
         return self._scale_factor
     
     def itemChange(self, change, value):
-        # ✅ 不需要额外处理位置变化，Qt 父项系统自动处理
-        if change == QGraphicsItem.ItemSelectedHasChanged:
+        if change == QGraphicsItem.ItemPositionChange:
+            if self._parent_image:
+                parent_pos = self._parent_image.scenePos()
+                self._offset = value - parent_pos
+        elif change == QGraphicsItem.ItemSelectedHasChanged:
             if self.isSelected():
                 self.setZValue(200)
             else:
@@ -1566,22 +1546,16 @@ class EmojiItem(QGraphicsPixmapItem):
         return super().itemChange(change, value)
     
     def to_dict(self):
-        """
-        序列化为字典
-        ✅ 只保存 pos()，不保存 _offset
-        pos() 在 parentItem 存在时是相对父图片的坐标
-        pos() 在 parentItem 为 None 时是场景绝对坐标
-        """
-        data = {
+        return {
             "id": self.item_id(),
             "emoji": self._emoji_char,
             "font_size": self._font_size,
             "scale": self._scale_factor,
+            "pos": {"x": self.pos().x(), "y": self.pos().y()},
             "z": self.zValue(),
             "parent_id": self._parent_image.item_id() if self._parent_image else None,
-            "pos": {"x": self.pos().x(), "y": self.pos().y()},
+            "offset": {"x": self._offset.x(), "y": self._offset.y()},
         }
-        return data
 
 
 # ==================== Emoji选择对话框 ====================
@@ -2105,7 +2079,7 @@ class MovableImageItem(QGraphicsPixmapItem):
                     "emoji": e._emoji_char,
                     "font_size": e._font_size,
                     "scale": e.get_scale_factor(),
-                    "pos": {"x": e.pos().x(), "y": e.pos().y()},  # ✅ 改为 pos
+                    "offset": {"x": e._offset.x(), "y": e._offset.y()},
                     "z": e.zValue(),
                 }
                 for e in self._attached_emojis
@@ -2524,12 +2498,8 @@ class ImageCanvasView(QGraphicsView):
         # ====== 图片操作 ======
         if isinstance(item, MovableImageItem):
             if action == delete_act:
-                # 删除图片的同时删除 Emoji 文件
-                self._main_window._delete_emoji_file(item.item_id())
                 for emoji in item.get_attached_emojis():
                     self.scene().removeItem(emoji)
-                self._main_window._marker_manager.save_markers_for_item(item)
-                self._main_window._marker_manager.remove_overlay(item)
                 self.scene().removeItem(item)
                 if self._main_window:
                     self._main_window.update_status(None)
@@ -2661,9 +2631,6 @@ class ImageCanvasView(QGraphicsView):
             if action == delete_emoji_act:
                 if item.get_parent_image():
                     item.get_parent_image().remove_attached_emoji(item)
-                else:
-                    # 删除独立 Emoji 文件中的记录
-                    self._main_window._remove_orphan_emoji(item)
                 self.scene().removeItem(item)
                 if self._main_window:
                     self._main_window.schedule_autosave()
@@ -2684,8 +2651,6 @@ class ImageCanvasView(QGraphicsView):
                     self._main_window.schedule_autosave()
             elif action == detach_emoji_act:
                 item.detach_from_parent()
-                # 分离后保存到 orphans
-                self._main_window._save_orphan_emoji(item)
                 if self._main_window:
                     self._main_window.schedule_autosave()
             elif action == attach_emoji_act:
@@ -2693,8 +2658,6 @@ class ImageCanvasView(QGraphicsView):
                            if isinstance(i, MovableImageItem) and i != item]
                 if selected:
                     parent_img = selected[0]
-                    # 从 orphans 中移除
-                    self._main_window._remove_orphan_emoji(item)
                     item.detach_from_parent()
                     parent_img.add_attached_emoji(item)
                     if self._main_window:
@@ -2784,6 +2747,7 @@ class ImageCanvasView(QGraphicsView):
             event.acceptProposedAction()
 
 
+
 # ==================== 自动保存管理器 ====================
 class AutoSaveManager:
     def __init__(self):
@@ -2802,71 +2766,11 @@ class AutoSaveManager:
                 info = item.to_dict()
                 info["image_file"] = f"{iid}.png"
                 state["images"].append(info)
-                # ✅ 同时保存该图片的 Emoji 到独立文件
-                self._save_emojis_for_item(item)
-            elif isinstance(item, EmojiItem):
-                # ✅ 独立 Emoji 保存到 orphans
-                self._save_orphan_emoji(item)
-                # 同时保留在状态中作为备份
+            elif isinstance(item, EmojiItem) and not item.get_parent_image():
                 state["emojis"].append(item.to_dict())
         
         with open(self.state_file, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
-
-    def _save_emojis_for_item(self, item):
-        """保存某个图片的所有吸附 Emoji 到独立文件"""
-        if not isinstance(item, MovableImageItem):
-            return
-        emojis = item.get_attached_emojis()
-        if not emojis:
-            emoji_file = os.path.join(EMOJIS_DIR, f"{item.item_id()}.json")
-            if os.path.exists(emoji_file):
-                try:
-                    os.remove(emoji_file)
-                except:
-                    pass
-            return
-        
-        data = []
-        for emoji in emojis:
-            data.append({
-                "id": emoji.item_id(),
-                "emoji": emoji._emoji_char,
-                "font_size": emoji._font_size,
-                "scale": emoji.get_scale_factor(),
-                "pos": {"x": emoji.pos().x(), "y": emoji.pos().y()},  # ✅ 保存 pos
-                "z": emoji.zValue(),
-            })
-        
-        emoji_file = os.path.join(EMOJIS_DIR, f"{item.item_id()}.json")
-        with open(emoji_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
-    def _save_orphan_emoji(self, emoji):
-        """保存独立的 Emoji（没有父图片）"""
-        if emoji.get_parent_image():
-            return  # 有父图片的由上面的方法保存
-        orphans_file = os.path.join(EMOJIS_DIR, "orphans.json")
-        orphans = []
-        if os.path.exists(orphans_file):
-            try:
-                with open(orphans_file, "r", encoding="utf-8") as f:
-                    orphans = json.load(f)
-            except:
-                pass
-        
-        # 更新或添加
-        found = False
-        for i, o in enumerate(orphans):
-            if o.get("id") == emoji.item_id():
-                orphans[i] = emoji.to_dict()
-                found = True
-                break
-        if not found:
-            orphans.append(emoji.to_dict())
-        
-        with open(orphans_file, "w", encoding="utf-8") as f:
-            json.dump(orphans, f, ensure_ascii=False, indent=2)
 
     def has_autosave(self):
         return os.path.exists(self.state_file)
@@ -2910,73 +2814,40 @@ class AutoSaveManager:
             image_items[item.item_id()] = item
             count += 1
         
-        # ✅ 第二步：为每个图片恢复其 Emoji
-        for item_id, item in image_items.items():
-            self._load_emojis_for_item(item)
-            count += len(item.get_attached_emojis())
+        for img_info in state.get("images", []):
+            parent_id = img_info.get("id")
+            parent_img = image_items.get(parent_id)
+            if not parent_img:
+                continue
+            for emoji_info in img_info.get("attached_emojis", []):
+                emoji_char = emoji_info.get("emoji", "😀")
+                font_size = emoji_info.get("font_size", 48)
+                scale = emoji_info.get("scale", 1.0)
+                offset = emoji_info.get("offset", {"x": 0, "y": 0})
+                
+                emoji = EmojiItem(emoji_char, parent_item=None, font_size=font_size, item_id=emoji_info.get("id"))
+                emoji.set_scale_factor(scale)
+                emoji._offset = QPointF(offset.get("x", 0), offset.get("y", 0))
+                emoji.setParentItem(parent_img)
+                emoji.setPos(emoji._offset)
+                emoji.setZValue(emoji_info.get("z", 100))
+                emoji._parent_image = parent_img
+                parent_img._attached_emojis.append(emoji)
+                count += 1
         
-        # ✅ 第三步：恢复独立 Emoji（孤儿）
-        count += self._load_orphan_emojis(scene)
+        for emoji_info in state.get("emojis", []):
+            emoji_char = emoji_info.get("emoji", "😀")
+            font_size = emoji_info.get("font_size", 48)
+            emoji = EmojiItem(emoji_char, font_size=font_size, item_id=emoji_info.get("id"))
+            scale = emoji_info.get("scale", 1.0)
+            emoji.set_scale_factor(scale)
+            pos = emoji_info.get("pos", {})
+            emoji.setPos(pos.get("x", 0), pos.get("y", 0))
+            emoji.setZValue(emoji_info.get("z", 100))
+            scene.addItem(emoji)
+            count += 1
         
         return count
-
-    def _load_emojis_for_item(self, item):
-        """为指定图片加载其吸附的 Emoji"""
-        emoji_file = os.path.join(EMOJIS_DIR, f"{item.item_id()}.json")
-        if not os.path.exists(emoji_file):
-            return
-        
-        try:
-            with open(emoji_file, "r", encoding="utf-8") as f:
-                emojis_data = json.load(f)
-            
-            for data in emojis_data:
-                emoji = EmojiItem(
-                    data.get("emoji", "😀"),
-                    font_size=data.get("font_size", 48),
-                    item_id=data.get("id")
-                )
-                emoji.set_scale_factor(data.get("scale", 1.0))
-                
-                # ✅ 直接使用 pos
-                pos = data.get("pos", {})
-                emoji._parent_image = item
-                emoji.setParentItem(item)  # 先设置父项
-                emoji.setPos(pos.get("x", 0), pos.get("y", 0))  # 再设置相对位置
-                emoji.setZValue(data.get("z", 100))
-                
-                item._attached_emojis.append(emoji)
-                    
-        except Exception as e:
-            print(f"加载 Emoji 失败 ({item.item_id()}): {e}")
-
-    def _load_orphan_emojis(self, scene):
-        """恢复独立的 Emoji（没有父图片）"""
-        orphans_file = os.path.join(EMOJIS_DIR, "orphans.json")
-        if not os.path.exists(orphans_file):
-            return 0
-        
-        try:
-            with open(orphans_file, "r", encoding="utf-8") as f:
-                orphans = json.load(f)
-            
-            count = 0
-            for data in orphans:
-                emoji = EmojiItem(
-                    data.get("emoji", "😀"),
-                    font_size=data.get("font_size", 48),
-                    item_id=data.get("id")
-                )
-                emoji.set_scale_factor(data.get("scale", 1.0))
-                pos = data.get("pos", {})
-                emoji.setPos(pos.get("x", 0), pos.get("y", 0))
-                emoji.setZValue(data.get("z", 100))
-                scene.addItem(emoji)
-                count += 1
-            return count
-        except Exception as e:
-            print(f"加载独立 Emoji 失败: {e}")
-            return 0
 
 
 # ==================== 历史记录管理器 ====================
@@ -3031,6 +2902,7 @@ class HistoryManager:
             marker_file = os.path.join(MARKERS_DIR, f"{iid}.json")
             if os.path.exists(marker_file):
                 try:
+                    import shutil
                     dest_marker = os.path.join(state_dir, f"marker_{iid}.json")
                     shutil.copy2(marker_file, dest_marker)
                     info["has_marker"] = True
@@ -3040,35 +2912,11 @@ class HistoryManager:
                     info["has_marker"] = False
             else:
                 info["has_marker"] = False
-            
-            # ✅ 保存 Emoji 到历史目录
-            emoji_file_src = os.path.join(EMOJIS_DIR, f"{iid}.json")
-            if os.path.exists(emoji_file_src):
-                try:
-                    dest_emoji = os.path.join(state_dir, f"emoji_{iid}.json")
-                    shutil.copy2(emoji_file_src, dest_emoji)
-                    info["has_emojis"] = True
-                    info["emoji_file"] = f"emoji_{iid}.json"
-                except Exception as e:
-                    print(f"复制 Emoji 文件失败: {e}")
-                    info["has_emojis"] = False
-            else:
-                info["has_emojis"] = False
-            
             state["images"].append(info)
         
-        # 保存独立 Emoji
         for item in items:
             if isinstance(item, EmojiItem) and not item.get_parent_image():
                 state["emojis"].append(item.to_dict())
-        
-        # 保存独立 Emoji 到历史目录
-        orphans_file = os.path.join(EMOJIS_DIR, "orphans.json")
-        if os.path.exists(orphans_file):
-            try:
-                shutil.copy2(orphans_file, os.path.join(state_dir, "orphans.json"))
-            except:
-                pass
         
         state_path = os.path.join(state_dir, "state.json")
         with open(state_path, "w", encoding="utf-8") as f:
@@ -3190,6 +3038,7 @@ class HistoryManager:
                     src_marker = os.path.join(state_dir, marker_file)
                     if os.path.exists(src_marker):
                         try:
+                            import shutil
                             dest_marker = os.path.join(MARKERS_DIR, f"{img_info.get('id')}.json")
                             if os.path.exists(dest_marker):
                                 try:
@@ -3216,81 +3065,45 @@ class HistoryManager:
                         except Exception as e:
                             print(f"恢复历史标记失败: {e}")
             
-            # ✅ 恢复 Emoji
-            if img_info.get("has_emojis", False):
-                emoji_file = img_info.get("emoji_file", "")
-                if emoji_file:
-                    src_emoji = os.path.join(state_dir, emoji_file)
-                    if os.path.exists(src_emoji):
-                        try:
-                            dest_emoji = os.path.join(EMOJIS_DIR, f"{img_info.get('id')}.json")
-                            shutil.copy2(src_emoji, dest_emoji)
-                        except Exception as e:
-                            print(f"恢复历史 Emoji 失败: {e}")
-            
             count += 1
         
-
-        # 加载 Emoji
-        for item_id, item in image_items.items():
-            emoji_file = os.path.join(EMOJIS_DIR, f"{item_id}.json")
-            if os.path.exists(emoji_file):
-                try:
-                    with open(emoji_file, "r", encoding="utf-8") as f:
-                        emojis_data = json.load(f)
-                    for data in emojis_data:
-                        emoji = EmojiItem(
-                            data.get("emoji", "😀"),
-                            font_size=data.get("font_size", 48),
-                            item_id=data.get("id")
-                        )
-                        emoji.set_scale_factor(data.get("scale", 1.0))
-                        # ✅ 直接使用 pos
-                        pos = data.get("pos", {})
-                        emoji._parent_image = item
-                        emoji.setParentItem(item)  # 先设置父项
-                        emoji.setPos(pos.get("x", 0), pos.get("y", 0))  # 再设置相对位置
-                        emoji.setZValue(data.get("z", 100))
-                        
-                        item._attached_emojis.append(emoji)
-                        count += 1
-                except Exception as e:
-                    print(f"从历史恢复 Emoji 失败: {e}")
-        
-        # 恢复独立 Emoji
-        orphans_file = os.path.join(state_dir, "orphans.json")
-        if os.path.exists(orphans_file):
-            try:
-                dest_orphans = os.path.join(EMOJIS_DIR, "orphans.json")
-                shutil.copy2(orphans_file, dest_orphans)
-            except Exception as e:
-                print(f"恢复独立 Emoji 失败: {e}")
-            
-            try:
-                with open(orphans_file, "r", encoding="utf-8") as f:
-                    orphans = json.load(f)
-                for data in orphans:
-                    emoji = EmojiItem(
-                        data.get("emoji", "😀"),
-                        font_size=data.get("font_size", 48),
-                        item_id=data.get("id")
-                    )
-                    emoji.set_scale_factor(data.get("scale", 1.0))
-                    pos = data.get("pos", {})
-                    emoji.setPos(pos.get("x", 0), pos.get("y", 0))
-                    emoji.setZValue(data.get("z", 100))
-                    scene.addItem(emoji)
-                    count += 1
-            except Exception as e:
-                print(f"加载独立 Emoji 失败: {e}")
+        for img_info in state.get("images", []):
+            parent_id = img_info.get("id")
+            parent_img = image_items.get(parent_id)
+            if not parent_img:
+                continue
+            for emoji_info in img_info.get("attached_emojis", []):
+                emoji_char = emoji_info.get("emoji", "😀")
+                font_size = emoji_info.get("font_size", 48)
+                scale = emoji_info.get("scale", 1.0)
+                offset = emoji_info.get("offset", {"x": 0, "y": 0})
+                
+                emoji = EmojiItem(emoji_char, parent_item=None, font_size=font_size, item_id=emoji_info.get("id"))
+                emoji.set_scale_factor(scale)
+                emoji._offset = QPointF(offset.get("x", 0), offset.get("y", 0))
+                emoji.setParentItem(parent_img)
+                emoji.setPos(emoji._offset)
+                emoji.setZValue(emoji_info.get("z", 100))
+                emoji._parent_image = parent_img
+                parent_img._attached_emojis.append(emoji)
+                count += 1
         
         for emoji_info in state.get("emojis", []):
-            # 避免重复加载
-            pass
+            emoji_char = emoji_info.get("emoji", "😀")
+            font_size = emoji_info.get("font_size", 48)
+            emoji = EmojiItem(emoji_char, font_size=font_size, item_id=emoji_info.get("id"))
+            scale = emoji_info.get("scale", 1.0)
+            emoji.set_scale_factor(scale)
+            pos = emoji_info.get("pos", {})
+            emoji.setPos(pos.get("x", 0), pos.get("y", 0))
+            emoji.setZValue(emoji_info.get("z", 100))
+            scene.addItem(emoji)
+            count += 1
         
         return count
 
     def _delete_history_dir(self, hid):
+        import shutil
         d = os.path.join(HISTORY_DIR, hid)
         if os.path.isdir(d):
             shutil.rmtree(d, ignore_errors=True)
@@ -3305,14 +3118,14 @@ class HistoryManager:
 class ProjectInfo:
     NAME = "Image Canvas Stitcher"
     DISPLAY_NAME = "图片自由拼接工具"
-    VERSION = "3.35"
-    BUILD_DATE = "2026-07-31"
+    VERSION = "3.33"
+    BUILD_DATE = "2026-07-29"
     AUTHOR = "杜玛"
     COPYRIGHT = "© 永久 杜玛"
     LICENSE = "MIT"
     URL = "https://github.com/duma520/IntervalTracker"
     MAINTAINER_EMAIL = "不提供"
-    DESCRIPTION = "图片自由拼接工具 - 支持拖拽、粘贴、缩放、透明度调整、差异比对、历史记录、工具栏自定义、图片标记、Emoji表情（永久保留）"
+    DESCRIPTION = "图片自由拼接工具 - 支持拖拽、粘贴、缩放、透明度调整、差异比对、历史记录、工具栏自定义、图片标记、Emoji表情"
     TITLE_FORMAT = "{display_name} v{version}"
     TITLE_FORMAT_WITH_USER = "{display_name} v{version} - 当前用户: {username}"
     
@@ -3358,8 +3171,7 @@ class ProjectInfo:
             "提示：Ctrl+V粘贴 | 拖拽文件导入 | 左键拖动图片 | "
             "Ctrl+滚轮缩放视图 | 选中后滚轮缩放图片/Emoji | "
             "空格+左键/中键平移 | 右键菜单 | "
-            "Win+; 添加表情 | 表情可吸附到图片上同步移动 | "
-            "Emoji永久保留，重开/加载历史位置不变"
+            "Win+; 添加表情 | 表情可吸附到图片上同步移动"
         )
     
     @classmethod
@@ -3487,7 +3299,7 @@ class MarkerOverlay(QGraphicsItem):
         self.update()
     
     def set_pen_color(self, color):
-        self._pen_color = color        
+        self._pen_color = color
         self._dirty = True
         self.update()
     
@@ -4598,6 +4410,11 @@ class SettingsDialog(QDialog):
         self.accept()
 
 
+
+
+
+
+
 # ==================== 历史记录对话框 ====================
 class HistoryDialog(QDialog):
     def __init__(self, history_manager, parent=None):
@@ -4705,6 +4522,9 @@ class HistoryDialog(QDialog):
         return self._selected_id
 
 
+
+
+
 # ==================== 主窗口 ====================
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -4715,7 +4535,7 @@ class MainWindow(QMainWindow):
         self._set_app_icon()
         self._autosave_mgr = AutoSaveManager()
         self._history_mgr = HistoryManager()
-        self._history_mgr.set_main_window(self)
+        self._history_mgr.set_main_window(self)  # 传入主窗口引用用于截图
         self._marker_manager = MarkerManager()
         self._marker_tool = MarkerTool()
         self._marker_dialog = None
@@ -5195,8 +5015,6 @@ class MainWindow(QMainWindow):
         item = self._add_pixmap(pixmap, x, y)
         if item:
             self._marker_manager.load_markers_for_item(item)
-            # ✅ 加载 Emoji
-            self._autosave_mgr._load_emojis_for_item(item)
         return item
 
     def _add_pixmap(self, pixmap, x=None, y=None):
@@ -5247,15 +5065,12 @@ class MainWindow(QMainWindow):
                 item = self._add_pixmap(pixmap)
                 if item:
                     self._marker_manager.load_markers_for_item(item)
-                    self._autosave_mgr._load_emojis_for_item(item)
                 return
         QMessageBox.information(self, "提示", "剪贴板中没有图片，请先截图或复制图片后再粘贴。")
 
     def delete_selected(self):
         for item in self.scene.selectedItems():
             if isinstance(item, MovableImageItem):
-                # ✅ 删除该图片的 Emoji 文件
-                self._delete_emoji_file(item.item_id())
                 for emoji in item.get_attached_emojis():
                     self.scene.removeItem(emoji)
                 self._marker_manager.save_markers_for_item(item)
@@ -5264,61 +5079,10 @@ class MainWindow(QMainWindow):
             elif isinstance(item, EmojiItem):
                 if item.get_parent_image():
                     item.get_parent_image().remove_attached_emoji(item)
-                else:
-                    # ✅ 删除独立 Emoji 文件中的记录
-                    self._remove_orphan_emoji(item)
                 self.scene.removeItem(item)
         self.update_status(None)
         self.schedule_autosave()
         self.view.mark_background_dirty()
-
-    def _delete_emoji_file(self, item_id):
-        """删除图片对应的 Emoji 文件"""
-        emoji_file = os.path.join(EMOJIS_DIR, f"{item_id}.json")
-        if os.path.exists(emoji_file):
-            try:
-                os.remove(emoji_file)
-            except:
-                pass
-
-    def _remove_orphan_emoji(self, emoji):
-        """从 orphans.json 中移除独立 Emoji"""
-        orphans_file = os.path.join(EMOJIS_DIR, "orphans.json")
-        if not os.path.exists(orphans_file):
-            return
-        try:
-            with open(orphans_file, "r", encoding="utf-8") as f:
-                orphans = json.load(f)
-            orphans = [o for o in orphans if o.get("id") != emoji.item_id()]
-            with open(orphans_file, "w", encoding="utf-8") as f:
-                json.dump(orphans, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-    def _save_orphan_emoji(self, emoji):
-        """保存独立 Emoji 到 orphans.json"""
-        if emoji.get_parent_image():
-            return
-        orphans_file = os.path.join(EMOJIS_DIR, "orphans.json")
-        orphans = []
-        if os.path.exists(orphans_file):
-            try:
-                with open(orphans_file, "r", encoding="utf-8") as f:
-                    orphans = json.load(f)
-            except:
-                pass
-        
-        found = False
-        for i, o in enumerate(orphans):
-            if o.get("id") == emoji.item_id():
-                orphans[i] = emoji.to_dict()
-                found = True
-                break
-        if not found:
-            orphans.append(emoji.to_dict())
-        
-        with open(orphans_file, "w", encoding="utf-8") as f:
-            json.dump(orphans, f, ensure_ascii=False, indent=2)
 
     def scale_selected(self, factor):
         for item in self.scene.selectedItems():
@@ -5400,15 +5164,7 @@ class MainWindow(QMainWindow):
                 if isinstance(item, MovableImageItem):
                     self._marker_manager.save_markers_for_item(item)
                     self._marker_manager.remove_overlay(item)
-                    self._delete_emoji_file(item.item_id())
                 self.scene.removeItem(item)
-            # 清空 orphans
-            orphans_file = os.path.join(EMOJIS_DIR, "orphans.json")
-            if os.path.exists(orphans_file):
-                try:
-                    os.remove(orphans_file)
-                except:
-                    pass
             self.clear_diff_markers()
             self.update_status(None)
             self.schedule_autosave()
@@ -6007,6 +5763,7 @@ class MainWindow(QMainWindow):
     # ==================== 键盘事件 ====================
 
     def keyPressEvent(self, event):
+        # Win+; 打开Emoji选择器
         if event.key() == Qt.Key_Semicolon and event.modifiers() == Qt.MetaModifier:
             self.show_emoji_picker(None)
             event.accept()
@@ -6023,11 +5780,8 @@ class MainWindow(QMainWindow):
                     if isinstance(item, EmojiItem):
                         if item.get_parent_image():
                             item.get_parent_image().remove_attached_emoji(item)
-                        else:
-                            self._remove_orphan_emoji(item)
                         self.scene.removeItem(item)
                     elif isinstance(item, MovableImageItem):
-                        self._delete_emoji_file(item.item_id())
                         for emoji in item.get_attached_emojis():
                             self.scene.removeItem(emoji)
                         self._marker_manager.save_markers_for_item(item)
@@ -6077,12 +5831,6 @@ class MainWindow(QMainWindow):
         self._marker_manager.save_all_markers(
             [i for i in items if isinstance(i, MovableImageItem)]
         )
-        # ✅ 保存前先保存所有 Emoji 到独立文件
-        for item in self.scene.items():
-            if isinstance(item, MovableImageItem):
-                self._autosave_mgr._save_emojis_for_item(item)
-            elif isinstance(item, EmojiItem) and not item.get_parent_image():
-                self._save_orphan_emoji(item)
         self._do_autosave()
         if self._marker_dialog:
             self._marker_dialog.close()

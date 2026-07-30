@@ -2105,7 +2105,7 @@ class MovableImageItem(QGraphicsPixmapItem):
                     "emoji": e._emoji_char,
                     "font_size": e._font_size,
                     "scale": e.get_scale_factor(),
-                    "pos": {"x": e.pos().x(), "y": e.pos().y()},  # ✅ 改为 pos
+                    "offset": {"x": e._offset.x(), "y": e._offset.y()},
                     "z": e.zValue(),
                 }
                 for e in self._attached_emojis
@@ -3230,7 +3230,6 @@ class HistoryManager:
             
             count += 1
         
-
         # 加载 Emoji
         for item_id, item in image_items.items():
             emoji_file = os.path.join(EMOJIS_DIR, f"{item_id}.json")
@@ -3245,13 +3244,15 @@ class HistoryManager:
                             item_id=data.get("id")
                         )
                         emoji.set_scale_factor(data.get("scale", 1.0))
-                        # ✅ 直接使用 pos
-                        pos = data.get("pos", {})
-                        emoji._parent_image = item
-                        emoji.setParentItem(item)  # 先设置父项
-                        emoji.setPos(pos.get("x", 0), pos.get("y", 0))  # 再设置相对位置
+                        emoji._offset = QPointF(
+                            data.get("offset", {}).get("x", 0),
+                            data.get("offset", {}).get("y", 0)
+                        )
                         emoji.setZValue(data.get("z", 100))
                         
+                        emoji._parent_image = item
+                        emoji.setParentItem(item)
+                        emoji.setPos(emoji._offset)
                         item._attached_emojis.append(emoji)
                         count += 1
                 except Exception as e:
@@ -3305,7 +3306,7 @@ class HistoryManager:
 class ProjectInfo:
     NAME = "Image Canvas Stitcher"
     DISPLAY_NAME = "图片自由拼接工具"
-    VERSION = "3.35"
+    VERSION = "3.34"
     BUILD_DATE = "2026-07-31"
     AUTHOR = "杜玛"
     COPYRIGHT = "© 永久 杜玛"
