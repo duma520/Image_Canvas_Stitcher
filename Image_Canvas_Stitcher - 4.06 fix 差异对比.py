@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 图片自由拼接工具 - Image Canvas Stitcher (PySide6 版本)
-版本: 4.09
+版本: 4.05
 功能：
 - 从剪贴板粘贴图片 (Ctrl+V)
 - 拖拽文件导入图片
@@ -26,14 +26,6 @@
 - 【新增 v4.04】设置新增「整体缩放时背景显示缩放效果」开关，可让背景图案随视图缩放
 - 【新增 v4.05】新增「撤回上一步」功能（工具栏按钮 / Ctrl+Z / 右键菜单），支持图片、Emoji、标记、变换操作的撤销
 - 【新增 v4.05】差异比对增强：支持两图/多图比对、差异标记吸附到图片（随移动/缩放/旋转跟随）、可调差异判定阈值
-- 【新增 v4.05】新增「图内差异比对」：在一张图内框选两处相似区域，自动找出差异并吸附标记（工具栏「图内比对」/右键菜单）
-- 【新增 v4.07】修复「图内比对/比对差异」找不到差异的bug：改用快速像素比对（大图不再卡顿）、自动小范围对齐修正框选误差，支持麻将牌这类两张相似图
-- 【新增 v4.07】差异比对增强：新增「彩色RGB/灰度」两种比对方案、降采样提速、帧差式快而准的差异识别（类比对两帧差异）
-- 【新增 v4.07】新增 4 种相似度比对方案：灰度直方图（整体亮度分布）、SSIM 结构相似度（人眼感知+差异热力图）、特征点匹配（ORB，需 OpenCV）、感知哈希 pHash（海量去重）
-- 【新增 v4.07】SSIM 热力图可叠加显示在图片上，透明度可调（工具栏「热力」滑块）；显示方式可选「标记+热力图/仅热力图/仅标记」，实时切换
-- 【新增 v4.07】比对设置移入工具栏（方案下拉框+阈值滑块），图内比对/两图比对不再弹窗，比对后切换方案/阈值/显示方式实时重比对，设置永久保存
-- 【新增 v4.09】比对方案整合：彩色RGB/灰度合并为「像素差异」；直方图/特征点/pHash 也叠加像素差异标记+热力图，所有方案统一支持「标记/热力图/两者」显示方式
-- 【新增 v4.09】「自定义工具栏」同步新增组件：图内比对、比对方案下拉框、阈值滑块、热力透明度滑块、显示方式下拉框、撤回按钮均可单独开关
 """
 import sys
 import os
@@ -195,9 +187,6 @@ DEFAULT_SETTINGS = {
     "smooth_pixmap": True,
     "background_zoom": False,
     "diff_threshold": 30,
-    "diff_mode": "rgb",
-    "heatmap_opacity": 50,
-    "heatmap_display_mode": "both",
     "recent_emojis": [],
     "toolbar_visibility": {
         "btn_import": True,
@@ -220,11 +209,6 @@ DEFAULT_SETTINGS = {
         "global_opacity": True,
         "btn_diff": True,
         "btn_clear_diff": True,
-        "btn_internal_diff": True,
-        "diff_mode": True,
-        "diff_threshold": True,
-        "heatmap_opacity": True,
-        "heatmap_display_mode": True,
         "btn_save_hist": True,
         "btn_history": True,
         "btn_export": True,
@@ -2167,9 +2151,6 @@ class MovableImageItem(QGraphicsPixmapItem):
             elif isinstance(child, DiffOverlay):
                 # 差异标记覆盖层以图片左上角 (0,0) 为原点随图片缩放
                 child.setScale(child.scale() * ratio_x)
-            elif isinstance(child, HeatmapOverlay):
-                # 热力图覆盖层以图片左上角 (0,0) 为原点随图片缩放
-                child.setScale(child.scale() * ratio_x)
 
     # ====== Emoji 相关方法 ======
     def add_attached_emoji(self, emoji_item):
@@ -2274,27 +2255,6 @@ class DiffOverlay(QGraphicsItem):
         painter.restore()
 
 
-class HeatmapOverlay(QGraphicsPixmapItem):
-    """SSIM 差异热力图覆盖层 - 吸附到图片（随图片移动/缩放/旋转），可调透明度"""
-    def __init__(self, parent_item, heatmap_image, target_rect=None):
-        super().__init__(parent_item)
-        self._parent_item = parent_item
-        self.setFlag(QGraphicsItem.ItemIsSelectable, False)
-        self.setAcceptedMouseButtons(Qt.NoButton)  # 不拦截鼠标，点击可穿透到图片
-        if target_rect is None or target_rect.isEmpty():
-            target_rect = QRectF(0, 0,
-                                 parent_item.pixmap().width(),
-                                 parent_item.pixmap().height())
-        pm = QPixmap.fromImage(heatmap_image).scaled(
-            max(1, int(target_rect.width())), max(1, int(target_rect.height())),
-            Qt.IgnoreAspectRatio, Qt.SmoothTransformation
-        )
-        self.setPixmap(pm)
-        self.setPos(target_rect.x(), target_rect.y())
-        self.setOpacity(0.5)
-        self.setZValue(parent_item.zValue() + 0.05)
-
-
 class DiffSettingsDialog(QDialog):
     """差异比对参数设置对话框"""
     def __init__(self, parent=None):
@@ -2321,28 +2281,12 @@ class DiffSettingsDialog(QDialog):
         row.addWidget(self.slider, 1)
         row.addWidget(self.value_label)
         layout.addLayout(row)
-        # 比对方案选择
-        mode_row = QHBoxLayout()
-        mode_label = QLabel("比对方案:")
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItem("像素差异（标记+热力图，推荐）", "rgb")
-        self.mode_combo.addItem("灰度像素差异（更快）", "gray")
-        self.mode_combo.addItem("直方图（相似度）", "hist")
-        self.mode_combo.addItem("SSIM（相似度+热力图）", "ssim")
-        self.mode_combo.addItem("特征点匹配（相似度）", "feat")
-        self.mode_combo.addItem("感知哈希 pHash（相似度）", "phash")
-        mode_row.addWidget(mode_label)
-        mode_row.addWidget(self.mode_combo, 1)
-        layout.addLayout(mode_row)
         tip = QLabel(
-            "阈值（仅像素差异/灰度有效）越小越敏感：\n"
+            "阈值越小越敏感：\n"
             "0   = 任何细微差异都算差异（最敏感）\n"
             "30 = 默认值\n"
             "255 = 只有强烈差异才算差异（最宽松）\n"
-            "所有方案都支持「标记/热力图/两者」显示方式。\n"
-            "像素差异：逐像素比对，标记差异区域 + 差异热力图。\n"
-            "直方图/特征点/pHash：相似度评分 + 像素差异可视化。\n"
-            "SSIM：按人眼感知给出 0~1 相似度 + SSIM 热力图。"
+            "提示：阈值越低，标记出的差异区域越多。"
         )
         tip.setStyleSheet("color: #888; font-size: 11px; padding: 6px 2px;")
         tip.setWordWrap(True)
@@ -2357,47 +2301,14 @@ class DiffSettingsDialog(QDialog):
         val = int(self._settings.get("diff_threshold", 30))
         self.slider.setValue(val)
         self.value_label.setText(str(val))
-        mode = self._settings.get("diff_mode", "rgb")
-        idx = self.mode_combo.findData(mode)
-        if idx >= 0:
-            self.mode_combo.setCurrentIndex(idx)
 
     def _on_ok(self):
         self._settings.set("diff_threshold", self.slider.value())
-        self._settings.set("diff_mode", self.mode_combo.currentData())
         self._settings.save()
         self.accept()
 
     def get_threshold(self):
         return self.slider.value()
-
-    def get_mode(self):
-        return self.mode_combo.currentData()
-
-
-class SimilarityResultDialog(QDialog):
-    """相似度比对结果对话框：显示文字结论 + 可选热力图"""
-    def __init__(self, text, heat=None, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("差异比对结果")
-        self.resize(540, 600)
-        layout = QVBoxLayout(self)
-        label = QLabel(text)
-        label.setWordWrap(True)
-        label.setStyleSheet("font-size: 13px; padding: 8px;")
-        layout.addWidget(label)
-        if heat is not None and not heat.isNull():
-            pix = QPixmap.fromImage(heat).scaled(
-                480, 420, Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-            img_label = QLabel()
-            img_label.setPixmap(pix)
-            img_label.setAlignment(Qt.AlignCenter)
-            img_label.setStyleSheet("border: 1px solid #555; background: #1e1e1e;")
-            layout.addWidget(img_label, 1)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok)
-        buttons.accepted.connect(self.accept)
-        layout.addWidget(buttons)
 
 
 # ==================== 画布视图 ====================
@@ -2544,17 +2455,6 @@ class ImageCanvasView(QGraphicsView):
     def mousePressEvent(self, event):
         self._marker_click_handled = False
         
-        # 图内差异比对：框选两个区域
-        if (self._main_window and self._main_window._internal_diff_mode):
-            if event.button() == Qt.RightButton:
-                self._main_window.exit_internal_diff()
-                event.accept()
-                return
-            if event.button() == Qt.LeftButton and not self._space_pressed:
-                self._main_window._on_internal_diff_press(event)
-                event.accept()
-                return
-        
         if event.button() == Qt.MiddleButton or (
             event.button() == Qt.LeftButton and self._space_pressed
         ):
@@ -2605,9 +2505,6 @@ class ImageCanvasView(QGraphicsView):
         
         if event.button() == Qt.RightButton:
             item = self.itemAt(event.position().toPoint())
-            # 点击差异标记/热力图时穿透到其所在图片
-            if isinstance(item, (DiffOverlay, MarkerOverlay, HeatmapOverlay)) and getattr(item, "_parent_item", None):
-                item = item._parent_item
             if isinstance(item, MovableImageItem):
                 if not item.isSelected():
                     self.scene().clearSelection()
@@ -2633,13 +2530,6 @@ class ImageCanvasView(QGraphicsView):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        # 图内差异比对：拖动框选区域
-        if (self._main_window and self._main_window._internal_diff_mode and 
-                self._main_window._internal_diff_dragging):
-            self._main_window._on_internal_diff_move(event)
-            event.accept()
-            return
-        
         if (self._main_window and 
             self._main_window._marker_tool.mode != MarkerTool.MODE_OFF and
             self._main_window._marker_tool.is_drawing):
@@ -2678,13 +2568,6 @@ class ImageCanvasView(QGraphicsView):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        # 图内差异比对：完成一个区域的框选
-        if (self._main_window and self._main_window._internal_diff_mode and 
-                event.button() == Qt.LeftButton):
-            self._main_window._on_internal_diff_release(event)
-            event.accept()
-            return
-        
         if (self._main_window and 
             self._main_window._marker_tool.mode != MarkerTool.MODE_OFF and
             self._main_window._marker_tool.is_drawing and
@@ -2806,7 +2689,6 @@ class ImageCanvasView(QGraphicsView):
             view_fit_act = menu.addAction("📐 适配全部")
             menu.addSeparator()
             clear_diff_act = menu.addAction("🧹 清除差异标记")
-            internal_diff_act = menu.addAction("🖼️ 图内差异比对（框选两处区域）")
             menu.addSeparator()
             all_rotate_menu = menu.addMenu("🔄 整体旋转")
             all_rot_cw90 = all_rotate_menu.addAction("全部顺时针 90°")
@@ -3060,8 +2942,6 @@ class ImageCanvasView(QGraphicsView):
                 self.fit_all_items()
             elif action == clear_diff_act and self._main_window:
                 self._main_window.clear_diff_markers()
-            elif action == internal_diff_act and self._main_window:
-                self._main_window.start_internal_diff()
             elif action == all_rot_cw90:
                 for it in self.scene().items():
                     if isinstance(it, MovableImageItem):
@@ -3650,7 +3530,7 @@ class HistoryManager:
 class ProjectInfo:
     NAME = "Image Canvas Stitcher"
     DISPLAY_NAME = "图片自由拼接工具"
-    VERSION = "4.09"
+    VERSION = "4.05"
     BUILD_DATE = "2026-08-04"
     AUTHOR = "杜玛"
     COPYRIGHT = "© 永久 杜玛"
@@ -4216,7 +4096,6 @@ class ToolbarCustomizeDialog(QDialog):
             ("📁 文件操作", [
                 ("btn_import", "导入图片"),
                 ("btn_paste", "粘贴图片"),
-                ("btn_undo", "撤回上一步"),
                 ("btn_del", "删除"),
             ]),
             ("🔍 图片缩放", [
@@ -4248,11 +4127,6 @@ class ToolbarCustomizeDialog(QDialog):
             ("📊 差异比对", [
                 ("btn_diff", "比对差异"),
                 ("btn_clear_diff", "清除标记"),
-                ("btn_internal_diff", "图内比对"),
-                ("diff_mode", "比对方案下拉框"),
-                ("diff_threshold", "差异阈值滑块"),
-                ("heatmap_opacity", "热力透明度滑块"),
-                ("heatmap_display_mode", "显示方式下拉框"),
             ]),
             ("😀 Emoji表情", [
                 ("btn_emoji", "添加表情"),
@@ -5214,21 +5088,11 @@ class MainWindow(QMainWindow):
         self._draw_start_pos = None
         self._draw_path = None
         self._undo = UndoManager(self)
-        # 图内差异比对（一张图里框选两处相似区域找差异）
-        self._internal_diff_mode = False
-        self._internal_diff_dragging = False
-        self._diff_regions = []
-        self._diff_sel_rects = []
-        self._current_sel_rect = None
-        self._current_sel_image = None
-        self._current_sel_start = None
         
         self._autosave_timer = QTimer(self)
         self._autosave_timer.setSingleShot(True)
         self._autosave_timer.timeout.connect(self._do_autosave)
         self._diff_markers = []
-        self._heatmap_overlays = []
-        self._diff_context = None  # 上次比对上下文：(类型, 数据)，用于切换设置时实时重比对
         self.scene = QGraphicsScene(self)
         self.scene.setSceneRect(-5000, -5000, 10000, 10000)
         self.view = ImageCanvasView(self.scene, self)
@@ -5467,115 +5331,11 @@ class MainWindow(QMainWindow):
         widgets["btn_diff"] = btn_diff
 
         btn_clear_diff = QPushButton("清标记")
-        btn_clear_diff.setToolTip("清除所有差异标记/热力图，并停止实时比对")
-        btn_clear_diff.clicked.connect(self.clear_diff_all)
+        btn_clear_diff.setToolTip("清除所有差异红色标记")
+        btn_clear_diff.clicked.connect(self.clear_diff_markers)
         act_clear_diff = self._toolbar.addWidget(btn_clear_diff)
         actions["btn_clear_diff"] = act_clear_diff
         widgets["btn_clear_diff"] = btn_clear_diff
-
-        btn_internal_diff = QPushButton("图内比对")
-        btn_internal_diff.setToolTip(
-            "在一张图片内框选两处相似区域，找出并标记差异（吸附到图片）\n"
-            "框选两处区域后自动比对；切换工具栏方案/阈值可实时更新"
-        )
-        btn_internal_diff.clicked.connect(self.start_internal_diff)
-        act_internal_diff = self._toolbar.addWidget(btn_internal_diff)
-        actions["btn_internal_diff"] = act_internal_diff
-        widgets["btn_internal_diff"] = btn_internal_diff
-
-        # 比对方案下拉框（实时生效）
-        lbl_diff_mode = QLabel("方案:")
-        act_lbl_diff_mode = self._toolbar.addWidget(lbl_diff_mode)
-        actions["lbl_diff_mode"] = act_lbl_diff_mode
-        widgets["lbl_diff_mode"] = lbl_diff_mode
-
-        combo_diff_mode = QComboBox()
-        combo_diff_mode.addItem("像素差异", "rgb")
-        combo_diff_mode.addItem("直方图", "hist")
-        combo_diff_mode.addItem("SSIM", "ssim")
-        combo_diff_mode.addItem("特征点", "feat")
-        combo_diff_mode.addItem("pHash", "phash")
-        dmode = self._settings.get("diff_mode", "rgb")
-        didx = combo_diff_mode.findData(dmode)
-        combo_diff_mode.setCurrentIndex(didx if didx >= 0 else 0)
-        combo_diff_mode.setToolTip("比对方案：\n"
-                                   "像素差异：逐像素比对，标记差异区域（含热力图）\n"
-                                   "直方图/SSIM/特征点/pHash：相似度评分 + 差异可视化\n"
-                                   "所有方案均支持「标记/热力图/两者」显示方式\n"
-                                   "切换后自动重新比对，结果实时更新")
-        combo_diff_mode.currentIndexChanged.connect(self._on_diff_mode_changed)
-        act_combo_diff_mode = self._toolbar.addWidget(combo_diff_mode)
-        actions["combo_diff_mode"] = act_combo_diff_mode
-        widgets["combo_diff_mode"] = combo_diff_mode
-        self.combo_diff_mode = combo_diff_mode
-
-        # 阈值滑块（实时生效，松开后重比对）
-        lbl_diff_threshold = QLabel("阈值:")
-        act_lbl_diff_threshold = self._toolbar.addWidget(lbl_diff_threshold)
-        actions["lbl_diff_threshold"] = act_lbl_diff_threshold
-        widgets["lbl_diff_threshold"] = lbl_diff_threshold
-
-        sld_diff_threshold = QSlider(Qt.Horizontal)
-        sld_diff_threshold.setRange(0, 255)
-        sld_diff_threshold.setValue(int(self._settings.get("diff_threshold", 30)))
-        sld_diff_threshold.setFixedWidth(70)
-        sld_diff_threshold.setToolTip("差异判定阈值（RGB/灰度有效）：越小越敏感")
-        sld_diff_threshold.valueChanged.connect(self._on_diff_threshold_changed)
-        sld_diff_threshold.sliderReleased.connect(self._on_diff_threshold_released)
-        act_sld_diff_threshold = self._toolbar.addWidget(sld_diff_threshold)
-        actions["sld_diff_threshold"] = act_sld_diff_threshold
-        widgets["sld_diff_threshold"] = sld_diff_threshold
-        self.sld_diff_threshold = sld_diff_threshold
-
-        lbl_diff_threshold_val = QLabel(str(int(self._settings.get("diff_threshold", 30))))
-        lbl_diff_threshold_val.setFixedWidth(28)
-        lbl_diff_threshold_val.setAlignment(Qt.AlignCenter)
-        lbl_diff_threshold_val.setStyleSheet("color: #888;")
-        act_lbl_diff_threshold_val = self._toolbar.addWidget(lbl_diff_threshold_val)
-        actions["lbl_diff_threshold_val"] = act_lbl_diff_threshold_val
-        widgets["lbl_diff_threshold_val"] = lbl_diff_threshold_val
-        self.lbl_diff_threshold_val = lbl_diff_threshold_val
-
-        # 热力图透明度滑块（叠加在图片上的 SSIM 热力图透明度）
-        lbl_heat = QLabel("热力:")
-        act_lbl_heat = self._toolbar.addWidget(lbl_heat)
-        actions["lbl_heatmap"] = act_lbl_heat
-        widgets["lbl_heatmap"] = lbl_heat
-
-        sld_heatmap = QSlider(Qt.Horizontal)
-        sld_heatmap.setRange(0, 100)
-        sld_heatmap.setValue(int(self._settings.get("heatmap_opacity", 50)))
-        sld_heatmap.setFixedWidth(60)
-        sld_heatmap.setToolTip("SSIM 热力图叠加在图片上的透明度（0=隐藏，100=不透明）")
-        sld_heatmap.valueChanged.connect(self._set_heatmap_opacity)
-        sld_heatmap.sliderReleased.connect(self._save_heatmap_opacity)
-        act_sld_heat = self._toolbar.addWidget(sld_heatmap)
-        actions["sld_heatmap_opacity"] = act_sld_heat
-        widgets["sld_heatmap_opacity"] = sld_heatmap
-        self.sld_heatmap_opacity = sld_heatmap
-
-        # 显示模式下拉框：标记+热力图 / 仅热力图 / 仅标记
-        lbl_heat_mode = QLabel("显示:")
-        act_lbl_heat_mode = self._toolbar.addWidget(lbl_heat_mode)
-        actions["lbl_heatmap_mode"] = act_lbl_heat_mode
-        widgets["lbl_heatmap_mode"] = lbl_heat_mode
-
-        combo_heatmap_mode = QComboBox()
-        combo_heatmap_mode.addItem("标记+热力图", "both")
-        combo_heatmap_mode.addItem("仅热力图", "heat_only")
-        combo_heatmap_mode.addItem("仅标记", "marker_only")
-        mode = self._settings.get("heatmap_display_mode", "both")
-        idx = combo_heatmap_mode.findData(mode)
-        combo_heatmap_mode.setCurrentIndex(idx if idx >= 0 else 0)
-        combo_heatmap_mode.setToolTip("差异结果显示方式：\n"
-                                      "标记+热力图：红色差异框 + SSIM 热力图都显示\n"
-                                      "仅热力图：只显示热力图，不显示红色标记框\n"
-                                      "仅标记：只显示红色标记框，不显示热力图")
-        combo_heatmap_mode.currentIndexChanged.connect(self._on_heatmap_mode_changed)
-        act_combo_heat_mode = self._toolbar.addWidget(combo_heatmap_mode)
-        actions["combo_heatmap_mode"] = act_combo_heat_mode
-        widgets["combo_heatmap_mode"] = combo_heatmap_mode
-        self.combo_heatmap_mode = combo_heatmap_mode
 
         sep9 = self._toolbar.addSeparator()
         actions["sep9"] = sep9
@@ -5670,12 +5430,7 @@ class MainWindow(QMainWindow):
             "btn_front": "btn_front", "btn_back": "btn_back",
             "lbl_item": "item_opacity", "sld_item_opacity": "item_opacity", "lbl_item_opacity": "item_opacity",
             "lbl_global": "global_opacity", "sld_global_opacity": "global_opacity", "lbl_global_opacity": "global_opacity",
-            "btn_diff": "btn_diff", "btn_clear_diff": "btn_clear_diff", "btn_internal_diff": "btn_internal_diff",
-            "lbl_diff_mode": "diff_mode", "combo_diff_mode": "diff_mode",
-            "lbl_diff_threshold": "diff_threshold", "sld_diff_threshold": "diff_threshold",
-            "lbl_diff_threshold_val": "diff_threshold",
-            "lbl_heatmap": "heatmap_opacity", "sld_heatmap_opacity": "heatmap_opacity",
-            "lbl_heatmap_mode": "heatmap_display_mode", "combo_heatmap_mode": "heatmap_display_mode",
+            "btn_diff": "btn_diff", "btn_clear_diff": "btn_clear_diff",
             "btn_emoji": "btn_emoji", "btn_emoji_favorites": "btn_emoji_favorites",
             "btn_marker": "btn_marker", "btn_clear_markers": "btn_clear_markers",
             "btn_save_hist": "btn_save_hist", "btn_history": "btn_history",
@@ -6065,246 +5820,78 @@ class MainWindow(QMainWindow):
                 "按住 Ctrl 点击可多选。"
             )
             return
-        # 记住比对上下文，之后切换工具栏方案/阈值/显示方式可实时重比对
-        self._diff_context = ("compare", list(selected))
-        self._do_compare(selected)
-
-    def _do_compare(self, selected):
-        """执行多图比对（按工具栏当前方案/阈值，结果实时上屏，不弹窗）"""
-        threshold = int(self._settings.get("diff_threshold", 30))
-        mode = self._settings.get("diff_mode", "rgb")
+        # 弹窗设置差异判定阈值
+        dlg = DiffSettingsDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        threshold = dlg.get_threshold()
         self.clear_diff_markers()
         base_item = selected[0]
         base_img = base_item.original_pixmap().toImage().convertToFormat(QImage.Format_RGB32)
-        results = []
-        last_heat = None
-        for idx, other_item in enumerate(selected[1:], 1):
+        total_diff_regions = 0
+        for other_item in selected[1:]:
             other_img = other_item.original_pixmap().toImage().convertToFormat(QImage.Format_RGB32)
             if base_img.size() != other_img.size():
                 other_img = other_img.scaled(
                     base_img.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
                 )
-            msg, regions, heat, ok = self._run_similarity(base_img, other_img, mode, threshold)
-            last_heat = heat
-            display_mode = self._heatmap_display_mode()
-            show_markers = display_mode in ("both", "marker_only")
-            show_heatmap = display_mode in ("both", "heat_only")
-            if regions and show_markers:
-                overlay = DiffOverlay(other_item)
-                overlay.set_diff_rects(self._diff_local_rects(other_item, regions))
-                self._diff_markers.append(overlay)
-            if heat is not None and not heat.isNull() and show_heatmap:
-                hv = HeatmapOverlay(other_item, heat)
-                hv.setOpacity(self._settings.get("heatmap_opacity", 50) / 100.0)
-                self._heatmap_overlays.append(hv)
-            results.append(f"第{idx}张:\n{msg}")
-        self._show_similarity_result("\n\n".join(results), last_heat)
-
-    def _luma_bytes(self, img):
-        """转为灰度（每像素1字节），返回 (字节数组, bytesPerLine)"""
-        g = img.convertToFormat(QImage.Format_Grayscale8)
-        return g.constBits().tobytes(), g.bytesPerLine()
-
-    def _best_shift(self, a_bytes, a_bpl, b_bytes, b_bpl, w, h, max_shift=8,
-                    step=4, align_threshold=12):
-        """在 ±max_shift 内寻找使差异像素最少（diff>align_threshold）的偏移 (dx, dy)。
-        step=4 为 RGB（每像素4字节，取最大通道差），step=1 为灰度。
-        用「差异像素个数」而非「平均差异」评分，避免白色背景稀释导致错位被误判为对齐"""
-        step2 = max(2, min(w, h) // 80)
-        best_dx = best_dy = 0
-        best_score = None
-        # 偶步粗搜（±1 的精确对齐交给 _refine_shift），大幅减少候选数
-        for dy in range(-max_shift, max_shift + 1, 2):
-            for dx in range(-max_shift, max_shift + 1, 2):
-                count = 0
-                for y in range(max_shift, h - max_shift, step2):
-                    ao = y * a_bpl
-                    bo = (y + dy) * b_bpl
-                    for x in range(max_shift, w - max_shift, step2):
-                        o1 = ao + x * step
-                        o2 = bo + (x + dx) * step
-                        if o1 + step - 1 >= len(a_bytes) or o2 + step - 1 >= len(b_bytes):
-                            continue
-                        if step == 1:
-                            d = abs(a_bytes[o1] - b_bytes[o2])
-                        else:
-                            d = max(abs(a_bytes[o1] - b_bytes[o2]),
-                                    abs(a_bytes[o1 + 1] - b_bytes[o2 + 1]),
-                                    abs(a_bytes[o1 + 2] - b_bytes[o2 + 2]))
-                        if d > align_threshold:
-                            count += 1
-                if best_score is None or count < best_score:
-                    best_score = count
-                    best_dx = dx
-                    best_dy = dy
-        return best_dx, best_dy
-
-    def _refine_shift(self, a_bytes, a_bpl, b_bytes, b_bpl, w, h, cx, cy,
-                      block_size=4, threshold=12, max_shift=8, step=4):
-        """在粗搜结果 ±1 邻域内，用「差异块数」精确对齐。
-        白色背景会稀释粗搜评分（dx=1 与 dx=2 得分几乎相同），
-        而正确对齐时差异块数远少于错位时，可精确区分。"""
-        def count_blocks(dx, dy):
-            cnt = 0
-            # 只扫描中央区域带（约 1/4 面积），对齐判定无需全图，大幅提速
-            y0 = max(max_shift, h * 3 // 8)
-            y1 = min(h - max_shift, 5 * h // 8)
-            x0 = max(max_shift, w * 3 // 8)
-            x1 = min(w - max_shift, 5 * w // 8)
-            # 块内全像素扫描（与最终判定一致），确保 1px 错位细条也被计入
-            for by in range(y0, y1, block_size):
-                for bx in range(x0, x1, block_size):
-                    hit = False
-                    for py in range(by, min(by + block_size, y1)):
-                        ao = py * a_bpl
-                        bo = (py + dy) * b_bpl
-                        for px in range(bx, min(bx + block_size, x1)):
-                            o1 = ao + px * step
-                            o2 = bo + (px + dx) * step
-                            if step == 1:
-                                d = abs(a_bytes[o1] - b_bytes[o2])
-                            else:
-                                d = max(abs(a_bytes[o1] - b_bytes[o2]),
-                                        abs(a_bytes[o1 + 1] - b_bytes[o2 + 1]),
-                                        abs(a_bytes[o1 + 2] - b_bytes[o2 + 2]))
-                            if d > threshold:
-                                hit = True
+            w = min(base_img.width(), other_img.width())
+            h = min(base_img.height(), other_img.height())
+            block_size = 8
+            diff_blocks = []
+            for by in range(0, h, block_size):
+                for bx in range(0, w, block_size):
+                    has_diff = False
+                    for py in range(by, min(by + block_size, h)):
+                        if has_diff:
+                            break
+                        for px in range(bx, min(bx + block_size, w)):
+                            c1 = base_img.pixelColor(px, py)
+                            c2 = other_img.pixelColor(px, py)
+                            dr = abs(c1.red() - c2.red())
+                            dg = abs(c1.green() - c2.green())
+                            db = abs(c1.blue() - c2.blue())
+                            if dr + dg + db > threshold:
+                                has_diff = True
                                 break
-                        if hit:
-                            break
-                    if hit:
-                        cnt += 1
-            return cnt
-
-        best = (cx, cy)
-        best_n = None
-        # 十字候选（5个）：中心 + 上下左右，足够修正粗搜误差，比 3x3 快近一半
-        for (dx, dy) in [(cx, cy), (cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)]:
-            if not (-max_shift <= dx <= max_shift and -max_shift <= dy <= max_shift):
-                continue
-            n = count_blocks(dx, dy)
-            if best_n is None or n < best_n:
-                best_n = n
-                best = (dx, dy)
-        return best
-
-    def _diff_regions_between(self, img_a, img_b, threshold, mode="rgb",
-                              block_size=4, max_shift=4, max_dim=400, with_heat=False):
-        """帧差式差异比对引擎（快而准）：
-        1) 统一尺寸、必要时降采样（提速，同时等效扩大对齐范围）
-        2) RGB(最大通道差) 或 灰度 两种方案
-        3) 自动小范围对齐（修正框选/截图错位）
-        4) 块级差异判定 + 区域合并
-        返回全分辨率下的差异区域列表 [(rx,ry,rw,rh)]；
-        with_heat=True 时额外返回降采样尺寸的差异热力图 (regions, heatmap)。"""
-        img_a = img_a.convertToFormat(QImage.Format_RGB32)
-        img_b = img_b.convertToFormat(QImage.Format_RGB32)
-        w = min(img_a.width(), img_b.width())
-        h = min(img_a.height(), img_b.height())
-        if w < block_size or h < block_size:
-            return ([] if with_heat else [], None) if with_heat else []
-        img_a = img_a.copy(0, 0, w, h)
-        img_b = img_b.copy(0, 0, w, h)
-        # 降采样：提速，且让对齐在更小图像上进行（等效全分辨率对齐范围更大）
-        scale = 1.0
-        maxd = max(w, h)
-        if maxd > max_dim:
-            scale = max_dim / maxd
-            wa = img_a.scaled(max(1, int(round(w * scale))),
-                              max(1, int(round(h * scale))),
-                              Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-            wb = img_b.scaled(max(1, int(round(w * scale))),
-                              max(1, int(round(h * scale))),
-                              Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-        else:
-            wa, wb = img_a, img_b
-        ww = wa.width()
-        wh = wa.height()
-        use_gray = (mode == "gray")
-        if use_gray:
-            a_bytes, a_bpl = self._luma_bytes(wa)
-            b_bytes, b_bpl = self._luma_bytes(wb)
-            step = 1
-        else:
-            a_bytes = wa.constBits().tobytes()
-            b_bytes = wb.constBits().tobytes()
-            a_bpl = wa.bytesPerLine()
-            b_bpl = wb.bytesPerLine()
-            step = 4
-        # 自动对齐（修正框选/截图造成的错位）；已对齐(0,0)时跳过精搜以提速
-        dx, dy = 0, 0
-        if max_shift > 0:
-            dx, dy = self._best_shift(a_bytes, a_bpl, b_bytes, b_bpl,
-                                      ww, wh, max_shift, step, 12)
-            if dx != 0 or dy != 0:
-                dx, dy = self._refine_shift(a_bytes, a_bpl, b_bytes, b_bpl,
-                                            ww, wh, dx, dy,
-                                            block_size, 12, max_shift, step)
-        x0 = max_shift
-        y0 = max_shift
-        x1 = ww - max_shift
-        y1 = wh - max_shift
-        if x1 <= x0 or y1 <= y0:
-            return (([], None) if with_heat else [])
-        diff_blocks = []
-        heat_data = []
-        for by in range(y0, y1, block_size):
-            for bx in range(x0, x1, block_size):
-                has_diff = False
-                block_max = 0
-                for py in range(by, min(by + block_size, y1)):
-                    ao = py * a_bpl
-                    bo = (py + dy) * b_bpl
-                    for px in range(bx, min(bx + block_size, x1)):
-                        o1 = ao + px * step
-                        o2 = bo + (px + dx) * step
-                        if step == 1:
-                            d = abs(a_bytes[o1] - b_bytes[o2])
-                        else:
-                            d = max(abs(a_bytes[o1] - b_bytes[o2]),
-                                    abs(a_bytes[o1 + 1] - b_bytes[o2 + 1]),
-                                    abs(a_bytes[o1 + 2] - b_bytes[o2 + 2]))
-                        if d > block_max:
-                            block_max = d
-                        if d > threshold:
-                            has_diff = True
-                            break
                     if has_diff:
-                        break
-                if has_diff:
-                    diff_blocks.append((bx - x0, by - y0))
-                    if with_heat:
-                        heat_data.append((bx, by, min(1.0, block_max / 255.0)))
-        regions = self._merge_diff_blocks(diff_blocks, block_size, x1 - x0, y1 - y0)
-        # 映射回全分辨率坐标
-        inv = 1.0 / scale
-        mapped = [(int(round((rx + x0) * inv)), int(round((ry + y0) * inv)),
-                   int(round(rw * inv)), int(round(rh * inv)))
-                  for (rx, ry, rw, rh) in regions]
-        if with_heat:
-            heat = self._build_diff_heatmap(heat_data, block_size, ww, wh)
-            return mapped, heat
-        return mapped
-
-    def _build_diff_heatmap(self, heat_data, block_size, w, h):
-        """根据块级差异强度生成热力图：红=差异大，绿=相似（与 SSIM 热力图配色一致）"""
-        img = QImage(w, h, QImage.Format_RGB32)
-        img.fill(QColor(0, 220, 40))  # 默认绿（无差异）
-        for (bx, by, intensity) in heat_data:
-            if intensity >= 0.5:
-                t = (intensity - 0.5) * 2
-                col = QColor(int(255 * t), 60, int(140 * (1 - t)))
-            elif intensity >= 0.2:
-                col = QColor(0, 180, 255)
-            else:
-                col = QColor(0, 220, 40)
-            px = bx * block_size
-            py = by * block_size
-            for yy in range(py, min(py + block_size, h)):
-                for xx in range(px, min(px + block_size, w)):
-                    img.setPixel(xx, yy, col.rgb())
-        return img
-
+                        diff_blocks.append((bx, by))
+            if not diff_blocks:
+                continue
+            regions = self._merge_diff_blocks(diff_blocks, block_size, w, h)
+            # 将原始图片像素坐标映射到图片当前显示（本地）坐标
+            pw = other_item.pixmap().width()
+            ph = other_item.pixmap().height()
+            base_w = other_item.original_size().width()
+            base_h = other_item.original_size().height()
+            sx = pw / base_w if base_w else 1
+            sy = ph / base_h if base_h else 1
+            local_rects = []
+            for (rx, ry, rw, rh) in regions:
+                lx = rx * sx
+                ly = ry * sy
+                lw = rw * sx
+                lh = rh * sy
+                # 图片被水平/垂直镜像时，差异区域也要对应镜像
+                if other_item.is_flipped_horizontal():
+                    lx = pw - (rx + rw) * sx
+                if other_item.is_flipped_vertical():
+                    ly = ph - (ry + rh) * sy
+                local_rects.append(QRectF(lx, ly, lw, lh))
+            # 创建吸附到图片的差异覆盖层（随图片移动/缩放/旋转/翻转自动跟随）
+            overlay = DiffOverlay(other_item)
+            overlay.set_diff_rects(local_rects)
+            self._diff_markers.append(overlay)
+            total_diff_regions += len(regions)
+        if total_diff_regions == 0:
+            QMessageBox.information(self, "比对结果", "未检测到明显差异，两张图片几乎完全相同。")
+        else:
+            QMessageBox.information(
+                self, "比对完成",
+                f"检测到 {total_diff_regions} 处差异区域，已用红色半透明框标记。\n"
+                f"差异标记已吸附到图片，随图片移动/缩放/旋转而跟随。\n"
+                f"可点击「清除标记」按钮移除标记。"
+            )
 
     def _merge_diff_blocks(self, blocks, block_size, w, h):
         if not blocks:
@@ -6345,495 +5932,11 @@ class MainWindow(QMainWindow):
                     regions.append((rx, ry, rw, rh))
         return regions
 
-    # ==================== 相似度比对方案 ====================
-
-    def _prep_grayscale(self, img, max_dim=256):
-        """转灰度并降采样，返回 (字节数组, bytesPerLine, 宽, 高)"""
-        w = img.width()
-        h = img.height()
-        scale = min(1.0, max_dim / max(w, h))
-        if scale < 1.0:
-            img = img.scaled(max(1, int(w * scale)), max(1, int(h * scale)),
-                             Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-        g = img.convertToFormat(QImage.Format_Grayscale8)
-        return g.constBits().tobytes(), g.bytesPerLine(), g.width(), g.height()
-
-    def _hist_similarity(self, img_a, img_b):
-        """方案1：灰度直方图比对（0~1，越接近1越相似），比较整体亮度/对比度分布"""
-        a_bytes, a_bpl, aw, ah = self._prep_grayscale(img_a, 256)
-        b_bytes, b_bpl, bw, bh = self._prep_grayscale(img_b, 256)
-        w = min(aw, bw)
-        h = min(ah, bh)
-        ha = [0] * 256
-        hb = [0] * 256
-        for y in range(h):
-            ao = y * a_bpl
-            bo = y * b_bpl
-            for x in range(w):
-                ha[a_bytes[ao + x]] += 1
-                hb[b_bytes[bo + x]] += 1
-        sa = sum(ha) or 1
-        sb = sum(hb) or 1
-        inter = 0.0
-        for i in range(256):
-            inter += min(ha[i] / sa, hb[i] / sb)
-        return inter
-
-    def _ssim_similarity(self, img_a, img_b, window=8, k1=0.01, k2=0.03):
-        """方案2：结构相似性 SSIM（0~1）。返回 (平均SSIM, 低相似区域, 热力图QImage)"""
-        a_bytes, a_bpl, aw, ah = self._prep_grayscale(img_a, 200)
-        b_bytes, b_bpl, bw, bh = self._prep_grayscale(img_b, 200)
-        w = min(aw, bw)
-        h = min(ah, bh)
-        ws = window
-        L = 255.0
-        c1 = (k1 * L) ** 2
-        c2 = (k2 * L) ** 2
-        nw = w // ws
-        nh = h // ws
-        total = 0.0
-        count = 0
-        low_regions = []
-        ssim_map = []
-        for wy in range(0, nh * ws, ws):
-            row_scores = []
-            for wx in range(0, nw * ws, ws):
-                s1 = s2 = 0.0
-                for yy in range(wy, wy + ws):
-                    ao = yy * a_bpl
-                    bo = yy * b_bpl
-                    for xx in range(wx, wx + ws):
-                        s1 += a_bytes[ao + xx]
-                        s2 += b_bytes[bo + xx]
-                n = ws * ws
-                m1 = s1 / n
-                m2 = s2 / n
-                v1 = v2 = cov = 0.0
-                for yy in range(wy, wy + ws):
-                    ao = yy * a_bpl
-                    bo = yy * b_bpl
-                    for xx in range(wx, wx + ws):
-                        d1 = a_bytes[ao + xx] - m1
-                        d2 = b_bytes[bo + xx] - m2
-                        v1 += d1 * d1
-                        v2 += d2 * d2
-                        cov += d1 * d2
-                v1 /= n
-                v2 /= n
-                cov /= n
-                ssim = ((2 * m1 * m2 + c1) * (2 * cov + c2)) / \
-                       ((m1 * m1 + m2 * m2 + c1) * (v1 + v2 + c2))
-                row_scores.append(ssim)
-                total += ssim
-                count += 1
-                if ssim < 0.85:
-                    low_regions.append((wx, wy, ws, ws))
-            ssim_map.append(row_scores)
-        mean_ssim = total / count if count else 1.0
-        heat = self._ssim_heatmap(ssim_map, ws, w, h)
-        # 把低相似区域映射回 img_a 全分辨率坐标
-        sx = img_a.width() / w if w else 1
-        sy = img_a.height() / h if h else 1
-        regions = [(int(rx * sx), int(ry * sy), int(rw * sx), int(rh * sy))
-                   for (rx, ry, rw, rh) in low_regions]
-        return mean_ssim, regions, heat
-
-    def _ssim_heatmap(self, ssim_map, ws, w, h):
-        """把 SSIM 分数映射为彩色热力图：红=差异大，绿=相似"""
-        img = QImage(w, h, QImage.Format_RGB32)
-        rows = len(ssim_map)
-        for ry in range(rows):
-            row = ssim_map[ry]
-            for rx in range(len(row)):
-                s = row[rx]
-                if s >= 0.95:
-                    col = QColor(0, 220, 40)
-                elif s >= 0.85:
-                    col = QColor(0, 180, 255)
-                else:
-                    t = max(0.0, min(1.0, (0.85 - s) / 0.85))
-                    col = QColor(int(255 * t), 60, int(140 * (1 - t)))
-                px = rx * ws
-                py = ry * ws
-                for yy in range(py, min(py + ws, h)):
-                    for xx in range(px, min(px + ws, w)):
-                        img.setPixel(xx, yy, col.rgb())
-        return img
-
-    def _feature_match(self, img_a, img_b):
-        """方案3：特征点匹配（需 OpenCV）。返回 (结果文本, 是否成功)"""
-        try:
-            import cv2
-            import numpy as np
-        except ImportError:
-            return "特征点匹配需要安装 OpenCV：\npip install opencv-python numpy", False
-
-        def to_gray(img):
-            g = img.convertToFormat(QImage.Format_Grayscale8)
-            gw = g.width()
-            gh = g.height()
-            b = g.constBits().tobytes()
-            arr = np.frombuffer(b, dtype=np.uint8).reshape((gh, g.bytesPerLine()))[:, :gw]
-            return np.ascontiguousarray(arr)
-
-        try:
-            ga = to_gray(img_a)
-            gb = to_gray(img_b)
-            orb = cv2.ORB_create(nfeatures=1000)
-            kp1, des1 = orb.detectAndCompute(ga, None)
-            kp2, des2 = orb.detectAndCompute(gb, None)
-            if des1 is None or des2 is None or len(kp1) < 5 or len(kp2) < 5:
-                return "特征点过少，无法有效匹配（图片可能过于简单或差异过大）", False
-            bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-            matches = bf.match(des1, des2)
-            matches = sorted(matches, key=lambda x: x.distance)
-            good = [m for m in matches if m.distance < 50]
-            ratio = len(good) / max(len(matches), 1)
-            return (f"特征点匹配：图1 {len(kp1)} 个点，图2 {len(kp2)} 个点，"
-                    f"匹配 {len(matches)} 对，优质 {len(good)} 对\n"
-                    f"相似度约 {ratio * 100:.0f}%（匹配越密越相似）"), True
-        except Exception as e:
-            return f"特征点匹配出错：{e}", False
-
-    def _phash(self, img):
-        """感知哈希：缩放到 32x32 灰度 → DCT → 取 8x8 低频 → 按中位数生成 64 位哈希"""
-        g = img.convertToFormat(QImage.Format_Grayscale8).scaled(
-            32, 32, Qt.IgnoreAspectRatio, Qt.SmoothTransformation
-        )
-        b = g.constBits().tobytes()
-        n = 32
-        temp = [[0.0] * n for _ in range(n)]
-        dct = [[0.0] * n for _ in range(n)]
-        for u in range(n):
-            for v in range(n):
-                s = 0.0
-                for x in range(n):
-                    s += b[u * n + x] * math.cos(math.pi * (2 * x + 1) * v / (2 * n))
-                temp[u][v] = s
-        for u in range(n):
-            for v in range(n):
-                s = 0.0
-                for y in range(n):
-                    s += temp[y][v] * math.cos(math.pi * (2 * y + 1) * u / (2 * n))
-                dct[u][v] = s
-        coeffs = [int(round(dct[u][v])) for u in range(8) for v in range(8)]
-        med = sorted(coeffs)[len(coeffs) // 2]
-        h = 0
-        for i, c in enumerate(coeffs):
-            if c > med:
-                h |= (1 << i)
-        return h
-
-    def _phash_distance(self, img_a, img_b):
-        """方案4：感知哈希。返回 (汉明距离0~64, 相似度0~1)"""
-        h1 = self._phash(img_a)
-        h2 = self._phash(img_b)
-        d = bin(h1 ^ h2).count("1")
-        return d, 1.0 - d / 64.0
-
-    def _run_similarity(self, img_a, img_b, mode, threshold=30):
-        """运行比对方案，返回 (结果文本, 待标记区域, 热力图QImage或None, 是否成功)。
-        所有方案均返回 regions + heat，支持「标记/热力图/两者」三种显示方式。"""
-        if mode == "rgb":
-            regions, heat = self._diff_regions_between(img_a, img_b, threshold,
-                                                       mode="rgb", with_heat=True)
-            return (f"像素差异：检测到 {len(regions)} 处差异区域\n"
-                    f"（红色框标记差异区域，热力图红=差异大绿=相似）", regions, heat, True)
-        if mode == "gray":  # 兼容旧设置：灰度像素差异
-            regions, heat = self._diff_regions_between(img_a, img_b, threshold,
-                                                       mode="gray", with_heat=True)
-            return (f"灰度像素差异：检测到 {len(regions)} 处差异区域\n"
-                    f"（忽略颜色只看明暗）", regions, heat, True)
-        if mode == "hist":
-            score = self._hist_similarity(img_a, img_b)
-            # 附加像素差异可视化（标记 + 热力图），方便直观定位差异位置
-            regions, heat = self._diff_regions_between(img_a, img_b, threshold,
-                                                       mode="rgb", with_heat=True)
-            return (f"灰度直方图相似度：{score * 100:.1f}%\n"
-                    f"（1=亮度分布完全一致；越高越相似）\n"
-                    f"下方标记为像素差异可视化", regions, heat, True)
-        if mode == "ssim":
-            mean, regions, heat = self._ssim_similarity(img_a, img_b)
-            return (f"SSIM 结构相似度：{mean * 100:.1f}%\n"
-                    f"（1=人眼感知完全一致；<85% 的区域已标红）", regions, heat, True)
-        if mode == "feat":
-            text, ok = self._feature_match(img_a, img_b)
-            regions, heat = self._diff_regions_between(img_a, img_b, threshold,
-                                                       mode="rgb", with_heat=True)
-            if not ok:
-                text += "\n（未安装 OpenCV，已改用像素差异可视化）"
-            return (text, regions, heat, True)
-        if mode == "phash":
-            dist, sim = self._phash_distance(img_a, img_b)
-            regions, heat = self._diff_regions_between(img_a, img_b, threshold,
-                                                       mode="rgb", with_heat=True)
-            return (f"感知哈希（pHash）：汉明距离 {dist}/64\n"
-                    f"相似度 {sim * 100:.1f}%（距离越近越相似，0=完全一致）\n"
-                    f"下方标记为像素差异可视化", regions, heat, True)
-        return ("", [], None, True)
-
-    def _show_similarity_result(self, msg, heat=None):
-        # 不弹窗打断：结果直接实时显示在图片上（标记/热力图），文字放状态栏
-        self.status_label.setText(msg.replace("\n", "  |  "))
-
-    def _diff_local_rects(self, other_item, regions):
-        """把原图坐标的差异区域映射到图片当前显示（本地）坐标"""
-        pw = other_item.pixmap().width()
-        ph = other_item.pixmap().height()
-        base_w = other_item.original_size().width()
-        base_h = other_item.original_size().height()
-        sx = pw / base_w if base_w else 1
-        sy = ph / base_h if base_h else 1
-        local_rects = []
-        for (rx, ry, rw, rh) in regions:
-            lx = rx * sx
-            ly = ry * sy
-            lw = rw * sx
-            lh = rh * sy
-            if other_item.is_flipped_horizontal():
-                lx = pw - (rx + rw) * sx
-            if other_item.is_flipped_vertical():
-                ly = ph - (ry + rh) * sy
-            local_rects.append(QRectF(lx, ly, lw, lh))
-        return local_rects
-
     def clear_diff_markers(self):
         for marker in self._diff_markers:
             if marker and marker.scene():
                 self.scene.removeItem(marker)
         self._diff_markers = []
-        # 同时清除叠加在图片上的热力图
-        for ov in self._heatmap_overlays:
-            if ov and ov.scene():
-                self.scene.removeItem(ov)
-        self._heatmap_overlays = []
-
-    def clear_diff_all(self):
-        """清除所有差异标记/热力图，并停止实时重比对"""
-        self._diff_context = None
-        self.clear_diff_markers()
-
-    def _set_heatmap_opacity(self, value):
-        """实时调整所有热力图覆盖层的透明度"""
-        opacity = value / 100.0
-        for ov in self._heatmap_overlays:
-            if ov:
-                ov.setOpacity(opacity)
-
-    def _save_heatmap_opacity(self):
-        self._settings.set("heatmap_opacity", self.sld_heatmap_opacity.value())
-        self._settings.save()
-
-    def _heatmap_display_mode(self):
-        """当前差异显示模式：both=标记+热力图, heat_only=仅热力图, marker_only=仅标记"""
-        return self._settings.get("heatmap_display_mode", "both")
-
-    def _on_heatmap_mode_changed(self, index):
-        mode = self.combo_heatmap_mode.itemData(index)
-        self._settings.set("heatmap_display_mode", mode)
-        self._settings.save()
-        # 切换显示方式时重新生成覆盖层（例如 SSIM 仅热力图→标记+热力图需要补生成标记）
-        self._recompare()
-
-    def _on_diff_mode_changed(self, index):
-        """切换比对方案：保存设置并实时重新比对"""
-        mode = self.combo_diff_mode.itemData(index)
-        self._settings.set("diff_mode", mode)
-        self._settings.save()
-        self._recompare()
-
-    def _on_diff_threshold_changed(self, value):
-        """阈值拖动中：仅更新数值显示与设置（重比对在松开时进行，避免卡顿）"""
-        self.lbl_diff_threshold_val.setText(str(value))
-        self._settings.set("diff_threshold", value)
-
-    def _on_diff_threshold_released(self):
-        """阈值松开：保存设置并实时重新比对"""
-        self._settings.save()
-        self._recompare()
-
-    def _recompare(self):
-        """根据当前工具栏设置（方案/阈值/显示方式）重新执行上次比对，结果实时更新"""
-        ctx = self._diff_context
-        if not ctx:
-            return
-        ctype, data = ctx
-        if ctype == "compare":
-            # 确保选中的图片仍在场景中
-            alive = [it for it in data if it is not None and it.scene()]
-            if len(alive) >= 2:
-                self._do_compare(alive)
-        elif ctype == "internal":
-            self._do_internal_diff(data)
-
-    def _apply_heatmap_display_mode(self):
-        """根据当前显示模式，实时显示/隐藏所有差异标记与热力图覆盖层"""
-        mode = self._heatmap_display_mode()
-        has_heatmap = any(ov for ov in self._heatmap_overlays if ov)
-        show_markers = mode in ("both", "marker_only") or not has_heatmap
-        show_heatmap = mode in ("both", "heat_only")
-        for marker in self._diff_markers:
-            if marker:
-                marker.setVisible(show_markers)
-        for ov in self._heatmap_overlays:
-            if ov:
-                ov.setVisible(show_heatmap)
-
-    # ==================== 图内差异比对 ====================
-    
-    def start_internal_diff(self):
-        """进入「图内比对」模式：在一张图内框选两处相似区域找差异（按工具栏方案直接比对）"""
-        if self._internal_diff_mode:
-            self.exit_internal_diff()
-            return
-        self._internal_diff_mode = True
-        self._internal_diff_dragging = False
-        self._diff_regions = []
-        self._diff_sel_rects = []
-        self._current_sel_rect = None
-        self._current_sel_image = None
-        self._current_sel_start = None
-        self.view.viewport().setCursor(Qt.CrossCursor)
-        self.status_label.setText("图内比对：请在图片上框选第一处区域（右键取消）...")
-        self.view.viewport().update()
-
-    def exit_internal_diff(self):
-        """退出图内比对模式"""
-        self._internal_diff_mode = False
-        self._internal_diff_dragging = False
-        self._remove_diff_sel_rects()
-        self._diff_regions = []
-        self._current_sel_image = None
-        self._current_sel_start = None
-        self.view.viewport().setCursor(Qt.ArrowCursor)
-        self.update_status(None)
-        self.view.viewport().update()
-
-    def _remove_diff_sel_rects(self):
-        if self._current_sel_rect and self._current_sel_rect.scene():
-            self.scene.removeItem(self._current_sel_rect)
-        self._current_sel_rect = None
-        for r in self._diff_sel_rects:
-            if r and r.scene():
-                self.scene.removeItem(r)
-        self._diff_sel_rects = []
-
-    def _find_image_at(self, event):
-        """返回鼠标位置所在（或覆盖的）可移动图片"""
-        scene_pos = self.view.mapToScene(event.position().toPoint())
-        item = self.scene.itemAt(scene_pos, self.view.transform())
-        if isinstance(item, MovableImageItem):
-            return item
-        if isinstance(item, (DiffOverlay, MarkerOverlay, HeatmapOverlay)) and getattr(item, "_parent_item", None):
-            return item._parent_item
-        for it in self.scene.items(scene_pos):
-            if isinstance(it, MovableImageItem):
-                return it
-        return None
-
-    def _on_internal_diff_press(self, event):
-        target = self._find_image_at(event)
-        if target is None:
-            self.status_label.setText("图内比对：请先点击一张图片，再框选区域...")
-            return
-        local = target.mapFromScene(self.view.mapToScene(event.position().toPoint()))
-        self._current_sel_image = target
-        self._current_sel_start = local
-        self._internal_diff_dragging = True
-        # 创建当前框选矩形（吸附到图片本地坐标）
-        self._current_sel_rect = QGraphicsRectItem()
-        self._current_sel_rect.setPen(QPen(QColor(0, 160, 255), 2, Qt.DashLine))
-        self._current_sel_rect.setBrush(QBrush(QColor(0, 160, 255, 40)))
-        self._current_sel_rect.setZValue(10000)
-        self._current_sel_rect.setParentItem(target)
-        self._current_sel_rect.setRect(QRectF(local, local))
-        self.view.viewport().update()
-
-    def _on_internal_diff_move(self, event):
-        if not self._internal_diff_dragging or not self._current_sel_image:
-            return
-        local = self._current_sel_image.mapFromScene(
-            self.view.mapToScene(event.position().toPoint())
-        )
-        if self._current_sel_rect:
-            self._current_sel_rect.setRect(
-                QRectF(self._current_sel_start, local).normalized()
-            )
-            self.view.viewport().update()
-
-    def _on_internal_diff_release(self, event):
-        if not self._internal_diff_dragging or not self._current_sel_image:
-            return
-        local = self._current_sel_image.mapFromScene(
-            self.view.mapToScene(event.position().toPoint())
-        )
-        rect = QRectF(self._current_sel_start, local).normalized()
-        pw = self._current_sel_image.pixmap().width()
-        ph = self._current_sel_image.pixmap().height()
-        rect = rect.intersected(QRectF(0, 0, pw, ph))
-        self._internal_diff_dragging = False
-        if rect.width() < 5 or rect.height() < 5:
-            if self._current_sel_rect and self._current_sel_rect.scene():
-                self.scene.removeItem(self._current_sel_rect)
-            self._current_sel_rect = None
-            self.status_label.setText("区域太小，请重新框选当前区域...")
-            return
-        self._diff_regions.append((self._current_sel_image, QRectF(rect)))
-        if len(self._diff_regions) == 1:
-            # 第一处区域确定，把当前矩形保留为已选区域指示
-            if self._current_sel_rect:
-                self._diff_sel_rects.append(self._current_sel_rect)
-            self._current_sel_rect = None
-            self.status_label.setText("图内比对：已选第一处区域，请框选第二处区域（右键取消）...")
-        else:
-            self._run_internal_diff()
-
-    def _run_internal_diff(self):
-        if len(self._diff_regions) < 2:
-            return
-        regions = [(img_item, QRectF(r)) for (img_item, r) in self._diff_regions]
-        self._remove_diff_sel_rects()
-        self._diff_regions = []
-        # 记住比对上下文，之后切换工具栏方案/阈值/显示方式可实时重比对
-        self._diff_context = ("internal", regions)
-        self._do_internal_diff(regions)
-        self.exit_internal_diff()
-
-    def _do_internal_diff(self, regions):
-        """执行图内比对（按工具栏当前方案/阈值，结果实时上屏，不弹窗）"""
-        if len(regions) < 2:
-            return
-        (img1, r1), (img2, r2) = regions
-        self.clear_diff_markers()
-        # 从当前显示（本地）坐标裁剪两个区域
-        img_a = img1.pixmap().copy(r1.toRect()).toImage().convertToFormat(QImage.Format_RGB32)
-        img_b = img2.pixmap().copy(r2.toRect()).toImage().convertToFormat(QImage.Format_RGB32)
-        if img_a.isNull() or img_b.isNull() or img_a.width() < 1 or img_b.width() < 1:
-            self.status_label.setText("无法读取所选区域，请重新框选。")
-            return
-        threshold = int(self._settings.get("diff_threshold", 30))
-        mode = self._settings.get("diff_mode", "rgb")
-        # 所有方案统一：返回相似度文本 + 差异标记区域 + 热力图
-        msg, regions_out, heat, ok = self._run_similarity(img_a, img_b, mode, threshold)
-        display_mode = self._heatmap_display_mode()
-        show_markers = display_mode in ("both", "marker_only")
-        show_heatmap = display_mode in ("both", "heat_only")
-        # 在两处区域都标记差异（吸附到图片）
-        if regions_out and show_markers:
-            for (img_item, region_rect) in ((img1, r1), (img2, r2)):
-                rects = [
-                    QRectF(region_rect.x() + rx, region_rect.y() + ry, rw, rh)
-                    for (rx, ry, rw, rh) in regions_out
-                ]
-                overlay = DiffOverlay(img_item)
-                overlay.set_diff_rects(rects)
-                self._diff_markers.append(overlay)
-        # 热力图叠加到第二处框选区域上（吸附图片，透明度可调）
-        if heat is not None and not heat.isNull() and show_heatmap:
-            hv = HeatmapOverlay(img2, heat, r2)
-            hv.setOpacity(self._settings.get("heatmap_opacity", 50) / 100.0)
-            self._heatmap_overlays.append(hv)
-        self._show_similarity_result(msg, heat)
 
     # ==================== 标记工具方法 ====================
     
