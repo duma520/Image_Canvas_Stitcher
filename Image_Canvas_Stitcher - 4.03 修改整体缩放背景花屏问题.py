@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 图片自由拼接工具 - Image Canvas Stitcher (PySide6 版本)
-版本: 4.04
+版本: 3.34
 功能：
 - 从剪贴板粘贴图片 (Ctrl+V)
 - 拖拽文件导入图片
@@ -23,7 +23,6 @@
 - 在图片上画画做标记，并保存下来供下次使用
 - Emoji表情功能：Win+; 调出面板、右键/菜单添加、吸附锁定
 - 【新增 v3.34】Emoji独立文件保存，永久保留，彻底解决重开/加载历史位置错乱问题
-- 【新增 v4.04】设置新增「整体缩放时背景显示缩放效果」开关，可让背景图案随视图缩放
 """
 import sys
 import os
@@ -183,7 +182,6 @@ DEFAULT_SETTINGS = {
     "performance_mode": "balanced",
     "antialiasing": True,
     "smooth_pixmap": True,
-    "background_zoom": False,
     "recent_emojis": [],
     "toolbar_visibility": {
         "btn_import": True,
@@ -599,13 +597,8 @@ class ShapeGenerator:
 # ==================== 背景渲染器 ====================
 class BackgroundRenderer:
     @staticmethod
-    def render_background(settings, width, height, zoom=1.0):
+    def render_background(settings, width, height):
         bg_type = settings.get("background_type", "solid")
-        if zoom != 1.0:
-            # 缩放效果模式：把图案尺寸/间距按 zoom 放大，
-            # 使背景图案在屏幕上随整体缩放而缩放（且保持清晰）
-            settings = dict(settings)
-            settings["shape_size"] = settings.get("shape_size", 40) * zoom
         if bg_type == "solid":
             return BackgroundRenderer._render_solid(settings, width, height)
         elif bg_type == "shape":
@@ -1308,20 +1301,20 @@ class BackgroundCache:
             cls._instance = super().__new__(cls)
         return cls._instance
     
-    def get_background(self, settings, width, height, zoom=1.0):
-        key = self._make_key(settings, width, height, zoom)
+    def get_background(self, settings, width, height):
+        key = self._make_key(settings, width, height)
         if key in self._cache:
             return self._cache[key]
-        img = BackgroundRenderer.render_background(settings, width, height, zoom)
+        img = BackgroundRenderer.render_background(settings, width, height)
         self._cache[key] = img
         if len(self._cache) > 10:
             oldest = next(iter(self._cache))
             del self._cache[oldest]
         return img
     
-    def _make_key(self, settings, width, height, zoom=1.0):
+    def _make_key(self, settings, width, height):
         bg_type = settings.get("background_type", "solid")
-        parts = [bg_type, str(width), str(height), str(round(zoom, 4))]
+        parts = [bg_type, str(width), str(height)]
         if bg_type == "solid":
             parts.append(settings.get("background_color", "#2b2b2b"))
         elif bg_type == "shape":
@@ -2205,7 +2198,6 @@ class ImageCanvasView(QGraphicsView):
         self._right_menu_cooldown_ms = 150
         self._cached_bg_pixmap = None
         self._cached_bg_size = None
-        self._cached_bg_zoom = 1.0
         self._bg_dirty = True
         self._marker_click_handled = False
 
@@ -2222,38 +2214,23 @@ class ImageCanvasView(QGraphicsView):
             size = self.viewport().size()
         else:
             size = QSize(800, 600)
-        zoom_mode = bool(self._settings.get("background_zoom", False))
-        zoom = self.view_scale() if zoom_mode else 1.0
         if (self._cached_bg_pixmap is None or 
             self._cached_bg_size != size or
-            self._cached_bg_zoom != zoom or
             self._bg_dirty):
             self._bg_cache.clear()
             bg_img = self._bg_cache.get_background(
-                self._settings._settings, size.width(), size.height(), zoom
+                self._settings._settings, size.width(), size.height()
             )
             self._cached_bg_pixmap = QPixmap.fromImage(bg_img)
             self._cached_bg_size = size
-            self._cached_bg_zoom = zoom
             self._bg_dirty = False
         if self._cached_bg_pixmap and not self._cached_bg_pixmap.isNull():
-            if zoom_mode:
-                # 缩放效果模式：在场景坐标中绘制到当前可见区域，
-                # 背景图案随整体缩放而缩放（按 zoom 重新渲染，保持清晰）
-                visible = self.mapToScene(self.viewport().rect()).boundingRect()
-                painter.drawPixmap(
-                    QRectF(visible.x(), visible.y(), visible.width(), visible.height()),
-                    self._cached_bg_pixmap,
-                    QRectF(0, 0, self._cached_bg_pixmap.width(),
-                           self._cached_bg_pixmap.height())
-                )
-            else:
-                # 背景按视口（屏幕）坐标绘制，保持 1:1 铺满视口，
-                # 避免随场景平移/缩放导致背景被拉伸错位而花屏
-                painter.save()
-                painter.resetTransform()
-                painter.drawPixmap(0, 0, self._cached_bg_pixmap)
-                painter.restore()
+            # 背景按视口（屏幕）坐标绘制，保持 1:1 铺满视口，
+            # 避免随场景平移/缩放导致背景被拉伸错位而花屏
+            painter.save()
+            painter.resetTransform()
+            painter.drawPixmap(0, 0, self._cached_bg_pixmap)
+            painter.restore()
 
     def mark_background_dirty(self):
         self._bg_dirty = True
@@ -2263,7 +2240,6 @@ class ImageCanvasView(QGraphicsView):
         self._bg_cache.clear()
         self._cached_bg_pixmap = None
         self._cached_bg_size = None
-        self._cached_bg_zoom = 1.0
         self._bg_dirty = True
         self.viewport().update()
 
@@ -3386,8 +3362,8 @@ class HistoryManager:
 class ProjectInfo:
     NAME = "Image Canvas Stitcher"
     DISPLAY_NAME = "图片自由拼接工具"
-    VERSION = "4.04"
-    BUILD_DATE = "2026-08-04"
+    VERSION = "4.01"
+    BUILD_DATE = "2026-07-31"
     AUTHOR = "杜玛"
     COPYRIGHT = "© 永久 杜玛"
     LICENSE = "MIT"
@@ -4436,12 +4412,6 @@ class SettingsDialog(QDialog):
         image_layout.addRow("", preview_btn)
         layout.addWidget(self.image_frame)
         self.bg_type_btns.idClicked.connect(self._on_bg_type_changed)
-        self.zoom_effect_check = QCheckBox("整体缩放时，背景显示缩放效果")
-        self.zoom_effect_check.setToolTip(
-            "启用后，Ctrl+滚轮整体缩放时，背景图案会随视图一起缩放\n"
-            "（网格/形状会随缩放变大变小）；关闭则背景固定不动"
-        )
-        layout.addWidget(self.zoom_effect_check)
         layout.addStretch()
         return widget
 
@@ -4558,7 +4528,6 @@ class SettingsDialog(QDialog):
             self.perf_combo.setCurrentIndex(idx)
         self.aa_check.setChecked(s.get("antialiasing", True))
         self.smooth_check.setChecked(s.get("smooth_pixmap", True))
-        self.zoom_effect_check.setChecked(s.get("background_zoom", False))
 
     def _on_bg_type_changed(self, type_id):
         self.solid_frame.setVisible(type_id == 0)
@@ -4671,7 +4640,6 @@ class SettingsDialog(QDialog):
         result["performance_mode"] = self.perf_combo.currentData()
         result["antialiasing"] = self.aa_check.isChecked()
         result["smooth_pixmap"] = self.smooth_check.isChecked()
-        result["background_zoom"] = self.zoom_effect_check.isChecked()
         return result
 
     def _on_apply(self):
