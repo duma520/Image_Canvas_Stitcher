@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "timestamp": 1787408296.5021858,
+  "images": [
+    {
+      "id": "0c40c1ce",
+      "pos": {
+        "x": -378.8063225806452,
+        "y": -362.58185170253535
+      },
+      "scale": 1.4641000000000006,
+      "opacity": 1.0,
+      "rotation": 0.0,
+      "flipped_h": false,
+      "flipped_v": false,
+      "z": 8.0,
+      "attached_emojis": [],
+      "image_file": "0c40c1ce.png",
+      "has_marker": false,
+      "has_emojis": false
+    }
+  ],
+  "emojis": []
+}

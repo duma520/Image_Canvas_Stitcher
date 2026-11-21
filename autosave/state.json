@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "timestamp": 1786127407.5387683,
+  "images": [
+    {
+      "id": "caf1958d",
+      "pos": {
+        "x": 114.0,
+        "y": -244.5
+      },
+      "scale": 1.0,
+      "opacity": 1.0,
+      "rotation": 0.0,
+      "flipped_h": false,
+      "flipped_v": false,
+      "z": 1000.0,
+      "attached_emojis": [],
+      "image_file": "caf1958d.png"
+    },
+    {
+      "id": "697d7fbb",
+      "pos": {
+        "x": -536.0,
+        "y": -232.0
+      },
+      "scale": 1.0,
+      "opacity": 1.0,
+      "rotation": 0.0,
+      "flipped_h": false,
+      "flipped_v": false,
+      "z": 1.0,
+      "attached_emojis": [
+        {
+          "id": "3056b645",
+          "emoji": "✅",
+          "font_size": 48,
+          "scale": 1.0,
+          "pos": {
+            "x": 180.0,
+            "y": 171.0
+          },
+          "z": 200.0
+        }
+      ],
+      "image_file": "697d7fbb.png"
+    }
+  ],
+  "emojis": []
+}

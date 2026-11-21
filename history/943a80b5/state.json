@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "timestamp": 1785431017.3110592,
+  "images": [
+    {
+      "id": "0fe3cb92",
+      "pos": {
+        "x": -768.095410628019,
+        "y": -617.6838164251208
+      },
+      "scale": 1.0,
+      "opacity": 1.0,
+      "rotation": 0.0,
+      "flipped_h": false,
+      "flipped_v": false,
+      "z": 1000.0,
+      "attached_emojis": [
+        {
+          "id": "dda6ba08",
+          "emoji": "😈",
+          "font_size": 48,
+          "scale": 1.0,
+          "pos": {
+            "x": 228.1500000000001,
+            "y": 275.0944444444443
+          },
+          "z": 200.0
+        },
+        {
+          "id": "86f10a28",
+          "emoji": "🤑",
+          "font_size": 48,
+          "scale": 1.0,
+          "pos": {
+            "x": 342.69444444444434,
+            "y": 149.28333333333336
+          },
+          "z": 100.0
+        }
+      ],
+      "image_file": "0fe3cb92.png",
+      "has_marker": true,
+      "marker_file": "marker_0fe3cb92.json",
+      "has_emojis": true,
+      "emoji_file": "emoji_0fe3cb92.json"
+    }
+  ],
+  "emojis": []
+}

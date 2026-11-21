@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 图片自由拼接工具 - Image Canvas Stitcher (PySide6 版本)
-版本: 4.09
+版本: 4.30
 功能：
 - 从剪贴板粘贴图片 (Ctrl+V)
 - 拖拽文件导入图片
@@ -34,6 +34,7 @@
 - 【新增 v4.07】比对设置移入工具栏（方案下拉框+阈值滑块），图内比对/两图比对不再弹窗，比对后切换方案/阈值/显示方式实时重比对，设置永久保存
 - 【新增 v4.09】比对方案整合：彩色RGB/灰度合并为「像素差异」；直方图/特征点/pHash 也叠加像素差异标记+热力图，所有方案统一支持「标记/热力图/两者」显示方式
 - 【新增 v4.09】「自定义工具栏」同步新增组件：图内比对、比对方案下拉框、阈值滑块、热力透明度滑块、显示方式下拉框、撤回按钮均可单独开关
+- 【新增 v4.20】全面多线程优化：导出、自动保存、历史保存/加载、差异比对、背景渲染等重操作均采用 QThread 后台执行，UI 不再卡顿，状态栏实时显示进度
 """
 import sys
 import os
@@ -57,7 +58,573 @@ from PySide6.QtGui import (
     QPen, QColor, QBrush, QIcon, QPixmap, QTransform, QPainterPath,
     QPolygonF, QKeySequence, QFont, QFontMetrics
 )
-from PySide6.QtCore import Qt, QPointF, QRectF, QSizeF, QTimer, QSize, QRect, QPoint
+from PySide6.QtCore import Qt, QPointF, QRectF, QSizeF, QTimer, QSize, QRect, QPoint, QThread, Signal, QObject, QBuffer, QByteArray
+
+# ==================== 多线程 Worker 基础架构 ====================
+
+class WorkerSignals(QObject):
+    """Worker 线程信号集合——不设 parent，留在主线程避免 moveToThread 移动"""
+    finished = Signal(object)      # 完成时传递结果
+    error = Signal(str)            # 错误信息
+    progress = Signal(str)         # 进度消息
+    progress_percent = Signal(int) # 进度百分比 (0-100)
+
+
+class BaseWorker(QObject):
+    """所有 Worker 的基类，统一管理线程生命周期"""
+    
+    def __init__(self):
+        super().__init__()
+        self._signals = WorkerSignals()  # 无 parent，留在主线程
+        self._thread = None
+        self._is_running = False
+    
+    def start(self):
+        """在新线程中启动 Worker"""
+        if self._is_running:
+            return
+        self._thread = QThread()
+        self.moveToThread(self._thread)
+        self._thread.started.connect(self.run)
+        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.finished.connect(lambda: setattr(self, '_is_running', False))
+        self._thread.finished.connect(lambda: setattr(self, '_thread', None))
+        self._is_running = True
+        self._thread.start()
+    
+    def run(self):
+        """子类重写此方法实现具体逻辑，完成后需调用 self._finish(result)"""
+        pass
+    
+    def _finish(self, result=None):
+        """工作完成后调用，发出完成信号并退出线程"""
+        self._signals.finished.emit(result)
+        if self._thread:
+            self._thread.quit()
+    
+    def _report_progress(self, msg, percent=None):
+        """报告进度"""
+        self._signals.progress.emit(msg)
+        if percent is not None:
+            self._signals.progress_percent.emit(percent)
+    
+    def _report_error(self, msg):
+        """报告错误"""
+        self._signals.error.emit(msg)
+        if self._thread:
+            self._thread.quit()
+
+
+class ExportWorker(BaseWorker):
+    """导出大图的后台线程 Worker"""
+    
+    def __init__(self, scene_items, export_rect, result_size, output_path, ext,
+                 global_opacity=1.0, antialiasing=True, smooth_pixmap=True):
+        super().__init__()
+        self._scene_items = scene_items
+        self._export_rect = export_rect
+        self._result_size = result_size
+        self._output_path = output_path
+        self._ext = ext
+        self._global_opacity = global_opacity
+        self._antialiasing = antialiasing
+        self._smooth_pixmap = smooth_pixmap
+    
+    def run(self):
+        try:
+            import copy
+            items_data = copy.deepcopy(self._scene_items)
+            min_x, min_y, margin = self._export_rect
+            total_w, total_h = self._result_size
+            
+            self._report_progress("正在渲染导出图像...", 10)
+            
+            result = QImage(total_w, total_h, QImage.Format_ARGB32)
+            result.fill(Qt.transparent)
+            painter = QPainter(result)
+            if self._antialiasing:
+                painter.setRenderHint(QPainter.Antialiasing)
+            if self._smooth_pixmap:
+                painter.setRenderHint(QPainter.SmoothPixmapTransform)
+            
+            total_items = len(items_data)
+            for idx, item_info in enumerate(items_data):
+                item_type = item_info.get("type")
+                if item_type == "image":
+                    rect = item_info["rect"]
+                    cx = rect.center().x() - min_x + margin
+                    cy = rect.center().y() - min_y + margin
+                    painter.save()
+                    painter.translate(cx, cy)
+                    painter.rotate(item_info.get("rotation", 0))
+                    painter.setOpacity(item_info.get("opacity", 1.0) * self._global_opacity)
+                    pixmap = item_info["pixmap"]
+                    painter.drawPixmap(-pixmap.width() / 2, -pixmap.height() / 2, pixmap)
+                    painter.restore()
+                elif item_type == "emoji":
+                    rect = item_info["rect"]
+                    cx = rect.center().x() - min_x + margin
+                    cy = rect.center().y() - min_y + margin
+                    painter.save()
+                    painter.translate(cx, cy)
+                    painter.drawPixmap(
+                        -item_info["pixmap"].width() / 2,
+                        -item_info["pixmap"].height() / 2,
+                        item_info["pixmap"]
+                    )
+                    painter.restore()
+                
+                if total_items > 0:
+                    pct = 10 + int(80 * (idx + 1) / total_items)
+                    self._report_progress(f"渲染中... ({idx + 1}/{total_items})", pct)
+            
+            painter.end()
+            
+            self._report_progress("正在保存文件...", 92)
+            
+            if self._ext in (".jpg", ".jpeg"):
+                bg = QImage(result.size(), QImage.Format_RGB32)
+                bg.fill(Qt.white)
+                p = QPainter(bg)
+                p.drawImage(0, 0, result)
+                p.end()
+                bg.save(self._output_path, quality=95)
+            else:
+                result.save(self._output_path)
+            
+            self._report_progress("导出完成", 100)
+            self._finish({
+                "path": self._output_path,
+                "width": total_w,
+                "height": total_h
+            })
+        except Exception as e:
+            self._report_error(f"导出失败: {e}")
+
+
+class SaveWorker(BaseWorker):
+    """自动保存/历史保存的后台线程 Worker（仅处理文件 I/O，不访问 QObject）"""
+    
+    def __init__(self, save_type, data):
+        """
+        save_type: "autosave" | "history"
+        data: 已在主线程预提取的纯数据字典（不含 live QObject）
+        """
+        super().__init__()
+        self._save_type = save_type
+        self._data = data
+    
+    def run(self):
+        try:
+            if self._save_type == "autosave":
+                self._do_autosave()
+            elif self._save_type == "history":
+                self._do_history_save()
+        except Exception as e:
+            self._report_error(f"保存失败: {e}")
+    
+    def _do_autosave(self):
+        self._report_progress("正在自动保存...", 0)
+        images_data = self._data["images_data"]  # 列表: {"iid", "pixmap_bytes", "info_dict"}
+        emojis_data = self._data.get("emojis_data", [])  # 列表: {"iid", "emojis_list"}
+        orphan_emojis = self._data.get("orphan_emojis", [])
+        state_file = self._data["state_file"]
+        images_dir = self._data["images_dir"]
+        emojis_dir = self._data["emojis_dir"]
+        
+        state = {"version": 1, "timestamp": time.time(), "images": [], "emojis": []}
+        total = len(images_data)
+        
+        for idx, img_entry in enumerate(images_data):
+            iid = img_entry["iid"]
+            img_path = os.path.join(images_dir, f"{iid}.png")
+            # ✅ 直接写 PNG 字节到磁盘，不在工作线程创建任何 Qt 对象
+            with open(img_path, "wb") as f:
+                f.write(img_entry["pixmap_bytes"])
+            state["images"].append(img_entry["info_dict"])
+            if total > 0:
+                self._report_progress(f"自动保存... ({idx + 1}/{total})", int(30 + 60 * (idx + 1) / total))
+        
+        # 写入 Emoji 数据文件
+        for em_entry in emojis_data:
+            iid = em_entry["iid"]
+            emojis_list = em_entry["emojis_list"]
+            if not emojis_list:
+                emoji_file = os.path.join(emojis_dir, f"{iid}.json")
+                if os.path.exists(emoji_file):
+                    try:
+                        os.remove(emoji_file)
+                    except:
+                        pass
+            else:
+                emoji_file = os.path.join(emojis_dir, f"{iid}.json")
+                with open(emoji_file, "w", encoding="utf-8") as f:
+                    json.dump(emojis_list, f, ensure_ascii=False, indent=2)
+        
+        # 写入独立 Emoji
+        if orphan_emojis:
+            orphans_file = os.path.join(emojis_dir, "orphans.json")
+            with open(orphans_file, "w", encoding="utf-8") as f:
+                json.dump(orphan_emojis, f, ensure_ascii=False, indent=2)
+        
+        self._report_progress("正在写入状态文件...", 95)
+        with open(state_file, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        
+        self._report_progress("自动保存完成", 100)
+        self._finish({"count": len(images_data)})
+
+    def _do_history_save(self):
+        self._report_progress("正在保存历史记录...", 5)
+        d = self._data
+        
+        # 创建历史目录
+        state_dir = d["state_dir"]
+        os.makedirs(state_dir, exist_ok=True)
+        
+        # 写入图片文件
+        images_data = d.get("images_data", [])
+        state = {"version": 1, "timestamp": d.get("timestamp", time.time()),
+                 "images": [], "emojis": d.get("orphan_emojis", [])}
+        total = len(images_data)
+        
+        for idx, img_entry in enumerate(images_data):
+            iid = img_entry["iid"]
+            img_path = os.path.join(state_dir, f"{iid}.png")
+            with open(img_path, "wb") as f:
+                f.write(img_entry["pixmap_bytes"])
+            state["images"].append(img_entry["info_dict"])
+            if total > 0:
+                self._report_progress(f"保存图片... ({idx + 1}/{total})",
+                                      int(5 + 30 * (idx + 1) / total))
+        
+        # 写入标记文件
+        marker_files = d.get("marker_files", [])
+        for mf in marker_files:
+            dest_path = os.path.join(state_dir, mf["dest_name"])
+            with open(dest_path, "wb") as f:
+                f.write(mf["data"])
+        
+        # 写入 Emoji 文件
+        emoji_files = d.get("emoji_files", [])
+        for ef in emoji_files:
+            dest_path = os.path.join(state_dir, ef["dest_name"])
+            with open(dest_path, "wb") as f:
+                f.write(ef["data"])
+        
+        # 写入孤儿 Emoji 文件
+        orphans_data = d.get("orphans_data")
+        if orphans_data:
+            dest_path = os.path.join(state_dir, "orphans.json")
+            with open(dest_path, "wb") as f:
+                f.write(orphans_data)
+        
+        self._report_progress("正在写入状态文件...", 60)
+        # 写入 state.json
+        state_path = os.path.join(state_dir, "state.json")
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        
+        # 写入缩略图
+        thumb_bytes = d.get("thumb_bytes")
+        if thumb_bytes:
+            thumb_path = os.path.join(state_dir, "thumb.png")
+            with open(thumb_path, "wb") as f:
+                f.write(thumb_bytes)
+        
+        self._report_progress("正在更新索引...", 80)
+        # 更新索引文件
+        history_mgr = d.get("history_mgr")
+        if history_mgr:
+            entry = {
+                "id": d.get("hid"),
+                "title": d.get("title", ""),
+                "timestamp": d.get("timestamp", time.time()),
+                "image_count": len(images_data),
+            }
+            history_mgr._index.insert(0, entry)
+            max_items = d.get("max_history")
+            if max_items is not None and len(history_mgr._index) > max_items:
+                old = history_mgr._index[max_items:]
+                history_mgr._index = history_mgr._index[:max_items]
+                for e in old:
+                    history_mgr._delete_history_dir(e["id"])
+            history_mgr._save_index()
+        
+        self._report_progress("历史记录保存完成", 100)
+        self._finish({"success": True})
+
+
+class LoadWorker(BaseWorker):
+    """加载自动保存/历史记录的后台线程 Worker"""
+    
+    def __init__(self, load_type, data):
+        """
+        load_type: "autosave" | "history"
+        data: 加载所需的数据字典
+        """
+        super().__init__()
+        self._load_type = load_type
+        self._data = data
+    
+    def run(self):
+        try:
+            if self._load_type == "autosave":
+                self._do_load_autosave()
+            elif self._load_type == "history":
+                self._do_load_history()
+        except Exception as e:
+            self._report_error(f"加载失败: {e}")
+    
+    def _do_load_autosave(self):
+        self._report_progress("正在恢复上次画面...", 0)
+        autosave_mgr = self._data["autosave_mgr"]
+        state_file = autosave_mgr.state_file
+        images_dir = autosave_mgr.images_dir
+        
+        if not os.path.exists(state_file):
+            self._report_error("没有找到自动保存文件")
+            return
+        
+        with open(state_file, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        
+        image_data = []
+        emoji_data = []
+        
+        total = len(state.get("images", []))
+        for idx, img_info in enumerate(state.get("images", [])):
+            img_file = os.path.join(images_dir, img_info.get("image_file", ""))
+            if not os.path.exists(img_file):
+                continue
+            # ✅ 在工作线程只读文件字节，不创建 QPixmap（避免 QBasicTimer 跨线程警告）
+            try:
+                with open(img_file, "rb") as f:
+                    img_bytes = f.read()
+            except Exception:
+                continue
+            if not img_bytes:
+                continue
+            
+            image_data.append({
+                "img_bytes": img_bytes,
+                "info": img_info,
+                "item_id": img_info.get("id"),
+                "scale": img_info.get("scale", 1.0),
+                "opacity": img_info.get("opacity", 1.0),
+                "z": img_info.get("z", 0),
+                "pos": img_info.get("pos", {}),
+                "rotation": img_info.get("rotation", 0.0),
+                "flipped_h": img_info.get("flipped_h", False),
+                "flipped_v": img_info.get("flipped_v", False),
+            })
+            
+            # 读取 Emoji 数据
+            emoji_file = os.path.join(EMOJIS_DIR, f"{img_info.get('id')}.json")
+            if os.path.exists(emoji_file):
+                try:
+                    with open(emoji_file, "r", encoding="utf-8") as f:
+                        emoji_data.append({
+                            "parent_id": img_info.get("id"),
+                            "emojis": json.load(f)
+                        })
+                except:
+                    pass
+            
+            if total > 0:
+                self._report_progress(f"加载图片... ({idx + 1}/{total})", int(10 + 70 * (idx + 1) / total))
+        
+        # 读取独立 Emoji
+        orphans = []
+        orphans_file = os.path.join(EMOJIS_DIR, "orphans.json")
+        if os.path.exists(orphans_file):
+            try:
+                with open(orphans_file, "r", encoding="utf-8") as f:
+                    orphans = json.load(f)
+            except:
+                pass
+        
+        self._report_progress("恢复完成", 100)
+        self._finish({
+            "images": image_data,
+            "emojis": emoji_data,
+            "orphans": orphans,
+            "count": len(image_data)
+        })
+    
+    def _do_load_history(self):
+        self._report_progress("正在加载历史记录...", 0)
+        hid = self._data["hid"]
+        history_mgr = self._data["history_mgr"]
+        
+        state_path = history_mgr.get_state_path(hid)
+        state_dir = history_mgr.get_state_dir(hid)
+        
+        if not os.path.exists(state_path):
+            self._report_error("历史记录文件不存在")
+            return
+        
+        with open(state_path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        
+        image_data = []
+        emoji_data = []
+        
+        total = len(state.get("images", []))
+        for idx, img_info in enumerate(state.get("images", [])):
+            img_file = os.path.join(state_dir, img_info.get("image_file", ""))
+            if not os.path.exists(img_file):
+                continue
+            # ✅ 在工作线程只读文件字节，不创建 QPixmap
+            try:
+                with open(img_file, "rb") as f:
+                    img_bytes = f.read()
+            except Exception:
+                continue
+            if not img_bytes:
+                continue
+            
+            image_data.append({
+                "img_bytes": img_bytes,
+                "info": img_info,
+                "item_id": img_info.get("id"),
+                "scale": img_info.get("scale", 1.0),
+                "opacity": img_info.get("opacity", 1.0),
+                "z": img_info.get("z", 0),
+                "pos": img_info.get("pos", {}),
+                "rotation": img_info.get("rotation", 0.0),
+                "flipped_h": img_info.get("flipped_h", False),
+                "flipped_v": img_info.get("flipped_v", False),
+                "has_marker": img_info.get("has_marker", False),
+                "marker_file": img_info.get("marker_file", ""),
+                "has_emojis": img_info.get("has_emojis", False),
+                "emoji_file": img_info.get("emoji_file", ""),
+            })
+            
+            if img_info.get("has_emojis", False):
+                emoji_src = os.path.join(state_dir, img_info.get("emoji_file", ""))
+                if os.path.exists(emoji_src):
+                    try:
+                        with open(emoji_src, "r", encoding="utf-8") as f:
+                            emoji_data.append({
+                                "parent_id": img_info.get("id"),
+                                "emojis": json.load(f)
+                            })
+                    except:
+                        pass
+            
+            if total > 0:
+                self._report_progress(f"加载历史... ({idx + 1}/{total})", int(10 + 70 * (idx + 1) / total))
+        
+        # 读取独立 Emoji
+        orphans = []
+        orphans_file = os.path.join(state_dir, "orphans.json")
+        if os.path.exists(orphans_file):
+            try:
+                with open(orphans_file, "r", encoding="utf-8") as f:
+                    orphans = json.load(f)
+            except:
+                pass
+        
+        self._report_progress("加载完成", 100)
+        self._finish({
+            "images": image_data,
+            "emojis": emoji_data,
+            "orphans": orphans,
+            "state_dir": state_dir,
+            "count": len(image_data)
+        })
+
+
+class DiffWorker(BaseWorker):
+    """差异比对的后台线程 Worker"""
+    
+    def __init__(self, diff_func, selected_data):
+        """
+        diff_func: 比对函数引用（字符串形式传递函数名）
+        selected_data: 序列化后的选中图片数据
+        """
+        super().__init__()
+        self._diff_func = diff_func
+        self._selected_data = selected_data
+    
+    def run(self):
+        try:
+            self._report_progress("正在比对差异...", 0)
+            results = self._diff_func(self._selected_data, self)
+            self._report_progress("比对完成", 100)
+            self._finish(results)
+        except Exception as e:
+            self._report_error(f"比对失败: {e}")
+
+
+class BackgroundRenderWorker(BaseWorker):
+    """背景渲染的后台线程 Worker"""
+    
+    def __init__(self, render_func, settings, width, height, zoom=1.0):
+        super().__init__()
+        self._render_func = render_func
+        self._settings = settings
+        self._width = width
+        self._height = height
+        self._zoom = zoom
+    
+    def run(self):
+        try:
+            self._report_progress("正在渲染背景...", 0)
+            result = self._render_func(self._settings, self._width, self._height, self._zoom)
+            self._report_progress("背景渲染完成", 100)
+            self._finish(result)
+        except Exception as e:
+            self._report_error(f"背景渲染失败: {e}")
+
+
+class _DiffComputeWorker(QObject):
+    """差异比对计算 Worker（在后台线程运行纯计算，避免 UI 卡顿）"""
+    
+    def __init__(self, base_img, compare_pairs, mode, threshold, main_window):
+        super().__init__()
+        self._signals = WorkerSignals()  # 无 parent，留在主线程
+        self._base_img = base_img
+        self._compare_pairs = compare_pairs
+        self._mode = mode
+        self._threshold = threshold
+        self._mw = main_window  # 引用 MainWindow 以调用其比对方法
+    
+    def run(self):
+        try:
+            results = []
+            for pair in self._compare_pairs:
+                base = self._base_img
+                other = pair["other_img"]
+                if base.size() != other.size():
+                    other = other.scaled(base.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                
+                msg, regions, heat, ok = self._mw._run_similarity(base, other, self._mode, self._threshold)
+                
+                # 通过 id 查找对应的 item
+                other_item = None
+                for item in self._mw.scene.items():
+                    if id(item) == pair["other_item_id"] and hasattr(item, 'original_pixmap'):
+                        other_item = item
+                        break
+                
+                results.append({
+                    "idx": pair["idx"],
+                    "other_item": other_item,
+                    "msg": msg,
+                    "regions": regions,
+                    "heat": heat,
+                })
+                
+                self._signals.progress.emit(f"比对中... ({pair['idx']}/{len(self._compare_pairs)})")
+            
+            self._signals.finished.emit(results)
+        except Exception as e:
+            self._signals.error.emit(f"比对计算出错: {e}")
+
+
+
 
 # ==================== 配置常量 ====================
 PROGRAM_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -199,6 +766,7 @@ DEFAULT_SETTINGS = {
     "heatmap_opacity": 50,
     "heatmap_display_mode": "both",
     "recent_emojis": [],
+    "auto_scale_on_add": True,
     "toolbar_visibility": {
         "btn_import": True,
         "btn_paste": True,
@@ -207,6 +775,8 @@ DEFAULT_SETTINGS = {
         "btn_zoom_in": True,
         "btn_zoom_out": True,
         "btn_reset": True,
+        "scale_percent": True,
+        "btn_unify_scale": True,
         "btn_rot_left": True,
         "btn_rot_right": True,
         "btn_flip_h": True,
@@ -3216,6 +3786,29 @@ class AutoSaveManager:
     def has_autosave(self):
         return os.path.exists(self.state_file)
 
+    def clear_autosave(self):
+        """清除所有自动保存文件（画布清空时调用）"""
+        # 删除 state.json
+        if os.path.exists(self.state_file):
+            try:
+                os.remove(self.state_file)
+            except Exception:
+                pass
+        # 删除所有图片文件
+        if os.path.exists(self.images_dir):
+            for fname in os.listdir(self.images_dir):
+                try:
+                    os.remove(os.path.join(self.images_dir, fname))
+                except Exception:
+                    pass
+        # 删除所有 Emoji 文件
+        if os.path.exists(EMOJIS_DIR):
+            for fname in os.listdir(EMOJIS_DIR):
+                try:
+                    os.remove(os.path.join(EMOJIS_DIR, fname))
+                except Exception:
+                    pass
+
     def load_state(self, scene, add_callback):
         if not self.has_autosave():
             return 0
@@ -3650,8 +4243,8 @@ class HistoryManager:
 class ProjectInfo:
     NAME = "Image Canvas Stitcher"
     DISPLAY_NAME = "图片自由拼接工具"
-    VERSION = "4.09"
-    BUILD_DATE = "2026-08-04"
+    VERSION = "4.30"
+    BUILD_DATE = "2026-08-07"
     AUTHOR = "杜玛"
     COPYRIGHT = "© 永久 杜玛"
     LICENSE = "MIT"
@@ -3744,12 +4337,18 @@ class MarkerOverlay(QGraphicsItem):
         super().__init__(parent_item)
         self._parent_item = parent_item
         self._marker_id = marker_id or str(uuid.uuid4())[:8]
-        self._paths = []
-        self._lines = []
-        self._rects = []
-        self._ellipses = []
-        self._arrows = []
-        self._texts = []
+        self._paths = []          # QPainterPath
+        self._path_colors = []    # str (color name) per path
+        self._lines = []          # (QPointF, QPointF)
+        self._line_colors = []    # str per line
+        self._rects = []          # QRectF
+        self._rect_colors = []    # str per rect
+        self._ellipses = []       # QRectF
+        self._ellipse_colors = [] # str per ellipse
+        self._arrows = []         # (QPointF, QPointF)
+        self._arrow_colors = []   # str per arrow
+        self._texts = []          # (QPointF, str)
+        self._text_colors = []    # str per text
         self._pen_color = QColor(255, 0, 0)
         self._pen_width = 3
         self.setZValue(parent_item.zValue() + 0.1)
@@ -3765,25 +4364,42 @@ class MarkerOverlay(QGraphicsItem):
         if not self._parent_item:
             return
         painter.save()
-        pen = QPen(self._pen_color, self._pen_width)
-        pen.setCapStyle(Qt.RoundCap)
-        pen.setJoinStyle(Qt.RoundJoin)
-        painter.setPen(pen)
         painter.setBrush(Qt.NoBrush)
-        for path in self._paths:
+        # 按每个元素自己的颜色绘制
+        for idx, path in enumerate(self._paths):
+            color = QColor(self._path_colors[idx]) if idx < len(self._path_colors) else self._pen_color
+            pen = QPen(color, self._pen_width)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            painter.setPen(pen)
             painter.drawPath(path)
-        for line in self._lines:
+        for idx, line in enumerate(self._lines):
+            color = QColor(self._line_colors[idx]) if idx < len(self._line_colors) else self._pen_color
+            pen = QPen(color, self._pen_width)
+            pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen)
             painter.drawLine(line[0], line[1])
-        for rect in self._rects:
+        for idx, rect in enumerate(self._rects):
+            color = QColor(self._rect_colors[idx]) if idx < len(self._rect_colors) else self._pen_color
+            pen = QPen(color, self._pen_width)
+            painter.setPen(pen)
             painter.drawRect(rect)
-        for ellipse in self._ellipses:
+        for idx, ellipse in enumerate(self._ellipses):
+            color = QColor(self._ellipse_colors[idx]) if idx < len(self._ellipse_colors) else self._pen_color
+            pen = QPen(color, self._pen_width)
+            painter.setPen(pen)
             painter.drawEllipse(ellipse)
-        for arrow in self._arrows:
+        for idx, arrow in enumerate(self._arrows):
+            color = QColor(self._arrow_colors[idx]) if idx < len(self._arrow_colors) else self._pen_color
+            pen = QPen(color, self._pen_width)
+            painter.setPen(pen)
             self._draw_arrow(painter, arrow[0], arrow[1])
-        if self._texts:
+        for idx, text_data in enumerate(self._texts):
+            color = QColor(self._text_colors[idx]) if idx < len(self._text_colors) else self._pen_color
+            pen = QPen(color, self._pen_width)
+            painter.setPen(pen)
             painter.setFont(QFont("Arial", self._pen_width + 8))
-            for text_data in self._texts:
-                painter.drawText(text_data[0], text_data[1])
+            painter.drawText(text_data[0], text_data[1])
         painter.restore()
     
     def _draw_arrow(self, painter, start, end):
@@ -3801,33 +4417,39 @@ class MarkerOverlay(QGraphicsItem):
         painter.drawLine(end, p1)
         painter.drawLine(end, p2)
     
-    def add_path(self, path):
+    def add_path(self, path, color=None):
         self._paths.append(path)
+        self._path_colors.append((color or self._pen_color).name())
         self._dirty = True
         self.update()
     
-    def add_line(self, start, end):
+    def add_line(self, start, end, color=None):
         self._lines.append((start, end))
+        self._line_colors.append((color or self._pen_color).name())
         self._dirty = True
         self.update()
     
-    def add_rect(self, rect):
+    def add_rect(self, rect, color=None):
         self._rects.append(rect)
+        self._rect_colors.append((color or self._pen_color).name())
         self._dirty = True
         self.update()
     
-    def add_ellipse(self, rect):
+    def add_ellipse(self, rect, color=None):
         self._ellipses.append(rect)
+        self._ellipse_colors.append((color or self._pen_color).name())
         self._dirty = True
         self.update()
     
-    def add_arrow(self, start, end):
+    def add_arrow(self, start, end, color=None):
         self._arrows.append((start, end))
+        self._arrow_colors.append((color or self._pen_color).name())
         self._dirty = True
         self.update()
     
-    def add_text(self, pos, text):
+    def add_text(self, pos, text, color=None):
         self._texts.append((pos, text))
+        self._text_colors.append((color or self._pen_color).name())
         self._dirty = True
         self.update()
     
@@ -3856,7 +4478,7 @@ class MarkerOverlay(QGraphicsItem):
             "arrows": [],
             "texts": []
         }
-        for path in self._paths:
+        for idx, path in enumerate(self._paths):
             points = []
             for i in range(path.elementCount()):
                 elem = path.elementAt(i)
@@ -3865,43 +4487,69 @@ class MarkerOverlay(QGraphicsItem):
                 except (TypeError, ValueError):
                     elem_type = 1
                 points.append({"x": elem.x, "y": elem.y, "type": elem_type})
-            data["paths"].append(points)
-        for line in self._lines:
-            data["lines"].append([
+            entry = {"points": points}
+            if idx < len(self._path_colors):
+                entry["color"] = self._path_colors[idx]
+            data["paths"].append(entry)
+        for idx, line in enumerate(self._lines):
+            entry = [
                 {"x": line[0].x(), "y": line[0].y()},
                 {"x": line[1].x(), "y": line[1].y()}
-            ])
-        for rect in self._rects:
-            data["rects"].append({
+            ]
+            if idx < len(self._line_colors):
+                entry.append({"color": self._line_colors[idx]})
+            data["lines"].append(entry)
+        for idx, rect in enumerate(self._rects):
+            entry = {
                 "x": rect.x(), "y": rect.y(),
                 "w": rect.width(), "h": rect.height()
-            })
-        for ellipse in self._ellipses:
-            data["ellipses"].append({
+            }
+            if idx < len(self._rect_colors):
+                entry["color"] = self._rect_colors[idx]
+            data["rects"].append(entry)
+        for idx, ellipse in enumerate(self._ellipses):
+            entry = {
                 "x": ellipse.x(), "y": ellipse.y(),
                 "w": ellipse.width(), "h": ellipse.height()
-            })
-        for arrow in self._arrows:
-            data["arrows"].append([
+            }
+            if idx < len(self._ellipse_colors):
+                entry["color"] = self._ellipse_colors[idx]
+            data["ellipses"].append(entry)
+        for idx, arrow in enumerate(self._arrows):
+            entry = [
                 {"x": arrow[0].x(), "y": arrow[0].y()},
                 {"x": arrow[1].x(), "y": arrow[1].y()}
-            ])
-        for text_data in self._texts:
-            data["texts"].append({
+            ]
+            if idx < len(self._arrow_colors):
+                entry.append({"color": self._arrow_colors[idx]})
+            data["arrows"].append(entry)
+        for idx, text_data in enumerate(self._texts):
+            entry = {
                 "x": text_data[0].x(), "y": text_data[0].y(),
                 "text": text_data[1]
-            })
+            }
+            if idx < len(self._text_colors):
+                entry["color"] = self._text_colors[idx]
+            data["texts"].append(entry)
         return data
     
     def from_dict(self, data):
         self._marker_id = data.get("id", str(uuid.uuid4())[:8])
         self._pen_color = QColor(data.get("color", "#ff0000"))
         self._pen_width = data.get("pen_width", 3)
+        default_color = self._pen_color.name()
         
         for path_data in data.get("paths", []):
+            # 向后兼容：旧格式是直接的 points 列表，新格式是 {"points": [...], "color": "..."}
+            if isinstance(path_data, dict) and "points" in path_data:
+                points = path_data["points"]
+                elem_color = path_data.get("color", default_color)
+            else:
+                points = path_data if isinstance(path_data, list) else []
+                elem_color = default_color
             path = QPainterPath()
             started = False
-            for point in path_data:
+            for point in points:
                 x = point.get("x", 0)
                 y = point.get("y", 0)
                 elem_type = point.get("type", 0)
@@ -3914,12 +4562,18 @@ class MarkerOverlay(QGraphicsItem):
                     path.lineTo(x, y)
             if path.elementCount() > 0:
                 self._paths.append(path)
+                self._path_colors.append(elem_color)
         
         for line_data in data.get("lines", []):
             if len(line_data) >= 2:
                 start = QPointF(line_data[0].get("x", 0), line_data[0].get("y", 0))
                 end = QPointF(line_data[1].get("x", 0), line_data[1].get("y", 0))
+                # 新格式: 第三个元素是 {"color": "..."} 
+                elem_color = default_color
+                if len(line_data) >= 3 and isinstance(line_data[2], dict):
+                    elem_color = line_data[2].get("color", default_color)
                 self._lines.append((start, end))
+                self._line_colors.append(elem_color)
         
         for rect_data in data.get("rects", []):
             x = rect_data.get("x", 0)
@@ -3928,6 +4582,7 @@ class MarkerOverlay(QGraphicsItem):
             h = rect_data.get("h", 0)
             if w > 0 and h > 0:
                 self._rects.append(QRectF(x, y, w, h))
+                self._rect_colors.append(rect_data.get("color", default_color))
         
         for ellipse_data in data.get("ellipses", []):
             x = ellipse_data.get("x", 0)
@@ -3936,18 +4591,24 @@ class MarkerOverlay(QGraphicsItem):
             h = ellipse_data.get("h", 0)
             if w > 0 and h > 0:
                 self._ellipses.append(QRectF(x, y, w, h))
+                self._ellipse_colors.append(ellipse_data.get("color", default_color))
         
         for arrow_data in data.get("arrows", []):
             if len(arrow_data) >= 2:
                 start = QPointF(arrow_data[0].get("x", 0), arrow_data[0].get("y", 0))
                 end = QPointF(arrow_data[1].get("x", 0), arrow_data[1].get("y", 0))
+                elem_color = default_color
+                if len(arrow_data) >= 3 and isinstance(arrow_data[2], dict):
+                    elem_color = arrow_data[2].get("color", default_color)
                 self._arrows.append((start, end))
+                self._arrow_colors.append(elem_color)
         
         for text_data in data.get("texts", []):
             pos = QPointF(text_data.get("x", 0), text_data.get("y", 0))
             text = text_data.get("text", "")
             if text:
                 self._texts.append((pos, text))
+                self._text_colors.append(text_data.get("color", default_color))
         
         self._dirty = True
         self.update()
@@ -3959,11 +4620,17 @@ class MarkerOverlay(QGraphicsItem):
     
     def clear(self):
         self._paths.clear()
+        self._path_colors.clear()
         self._lines.clear()
+        self._line_colors.clear()
         self._rects.clear()
+        self._rect_colors.clear()
         self._ellipses.clear()
+        self._ellipse_colors.clear()
         self._arrows.clear()
+        self._arrow_colors.clear()
         self._texts.clear()
+        self._text_colors.clear()
         self._dirty = True
         self.update()
 
@@ -4223,6 +4890,8 @@ class ToolbarCustomizeDialog(QDialog):
                 ("btn_zoom_in", "放大+"),
                 ("btn_zoom_out", "缩小-"),
                 ("btn_reset", "重置大小"),
+                ("scale_percent", "精确缩放百分比输入"),
+                ("btn_unify_scale", "统一缩放所有图片"),
             ]),
             ("🔄 图片旋转", [
                 ("btn_rot_left", "↺ 左旋"),
@@ -4355,7 +5024,7 @@ class MarkerToolDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("标记工具")
         self.setModal(False)
-        self.resize(350, 400)
+        self.resize(420, 620)
         self._main_window = None
         self._find_main_window(parent)
         self._marker_tool = None
@@ -4407,7 +5076,8 @@ class MarkerToolDialog(QDialog):
             mode_layout.addWidget(btn, row, col)
         layout.addWidget(mode_group)
         color_group = QGroupBox("颜色")
-        color_layout = QHBoxLayout(color_group)
+        color_main_layout = QVBoxLayout(color_group)
+        color_layout = QHBoxLayout()
         self.color_btn = QPushButton()
         self.color_btn.setFixedSize(60, 30)
         self.color_btn.clicked.connect(self._choose_color)
@@ -4415,6 +5085,38 @@ class MarkerToolDialog(QDialog):
         color_layout.addWidget(self.color_btn)
         color_layout.addWidget(self.color_label)
         color_layout.addStretch()
+        color_main_layout.addLayout(color_layout)
+        # 预设颜色按钮 - 多色系分组
+        self._add_preset_color_group(color_main_layout, "🎨 基础色系", [
+            ("#ff0000", "红"), ("#ff6600", "橙"), ("#ffcc00", "黄"),
+            ("#00cc00", "绿"), ("#0088ff", "蓝"), ("#8800ff", "紫"),
+            ("#ff00ff", "粉"), ("#00cccc", "青"), ("#000000", "黑"),
+            ("#ffffff", "白"), ("#888888", "灰"), ("#663300", "棕"),
+        ])
+        self._add_preset_color_group(color_main_layout, "🍬 马卡龙色系", [
+            ("#ffb3ba", "粉"), ("#ffdfba", "杏"), ("#ffffba", "奶黄"),
+            ("#baffc9", "薄荷"), ("#bae1ff", "天蓝"), ("#e8baff", "薰衣草"),
+            ("#ffb3d9", "玫瑰"), ("#b3ffe0", "青绿"), ("#ffd1b3", "桃"),
+            ("#d4b3ff", "淡紫"), ("#b3ffb3", "嫩绿"), ("#ffe6b3", "香槟"),
+        ])
+        self._add_preset_color_group(color_main_layout, "🖌️ 莫兰迪色系", [
+            ("#c49a8c", "豆沙"), ("#a3b5a7", "灰绿"), ("#b8a9c9", "灰紫"),
+            ("#d4c5b9", "奶咖"), ("#9db5b2", "雾蓝"), ("#c2a88d", "驼色"),
+            ("#b5a7a2", "灰粉"), ("#8fab93", "橄榄"), ("#c4b7a6", "米灰"),
+            ("#a8b8c8", "蓝灰"), ("#ccb8a8", "燕麦"), ("#b0a4b8", "烟紫"),
+        ])
+        self._add_preset_color_group(color_main_layout, "✨ 鲜艳/荧光色系", [
+            ("#ff0044", "艳红"), ("#ff4400", "橘红"), ("#ffdd00", "明黄"),
+            ("#00ff44", "荧光绿"), ("#00aaff", "亮蓝"), ("#aa00ff", "亮紫"),
+            ("#ff0088", "品红"), ("#00ffcc", "亮青"), ("#ff8800", "亮橙"),
+            ("#44ff00", "青柠"), ("#0088ff", "宝蓝"), ("#ff0066", "玫红"),
+        ])
+        self._add_preset_color_group(color_main_layout, "🌿 自然/大地色系", [
+            ("#8b4513", "鞍褐"), ("#556b2f", "橄榄绿"), ("#6b8e23", "草绿"),
+            ("#4682b4", "钢蓝"), ("#cd853f", "秘鲁"), ("#2e8b57", "海绿"),
+            ("#8b0000", "深红"), ("#daa520", "金菊"), ("#708090", "石板灰"),
+            ("#3cb371", "海洋绿"), ("#b8860b", "暗金"), ("#d2691e", "巧克力"),
+        ])
         layout.addWidget(color_group)
         size_group = QGroupBox("画笔大小")
         size_layout = QHBoxLayout(size_group)
@@ -4473,6 +5175,36 @@ class MarkerToolDialog(QDialog):
             self._marker_tool.color = color
             self.color_btn.setStyleSheet(f"background-color: {color.name()}; border: 1px solid #888;")
             self.color_label.setText(color.name())
+    
+    def _set_preset_color(self, hex_color):
+        """点击预设颜色按钮时调用"""
+        if not self._marker_tool:
+            return
+        color = QColor(hex_color)
+        self._marker_tool.color = color
+        self.color_btn.setStyleSheet(f"background-color: {color.name()}; border: 1px solid #888;")
+        self.color_label.setText(color.name())
+    
+    def _add_preset_color_group(self, parent_layout, label_text, colors):
+        """添加一组预设颜色（带标签和多行排列）"""
+        label = QLabel(label_text)
+        label.setStyleSheet("color: #666; font-size: 10px; font-weight: bold; margin-top: 4px;")
+        parent_layout.addWidget(label)
+        row_layout = QHBoxLayout()
+        row_layout.setSpacing(3)
+        for hex_color, name in colors:
+            btn = QPushButton()
+            btn.setFixedSize(22, 22)
+            btn.setToolTip(f"{name} ({hex_color})")
+            border_color = "#555" if hex_color == "#ffffff" else "#888"
+            btn.setStyleSheet(
+                f"background-color: {hex_color}; border: 1px solid {border_color};"
+                f"border-radius: 2px;"
+            )
+            btn.clicked.connect(lambda checked, c=hex_color: self._set_preset_color(c))
+            row_layout.addWidget(btn)
+        row_layout.addStretch()
+        parent_layout.addLayout(row_layout)
     
     def _on_mode_changed(self, mode_id):
         if self._marker_tool:
@@ -4734,6 +5466,14 @@ class SettingsDialog(QDialog):
         hist_layout.addWidget(self.history_spin)
         hist_layout.addStretch()
         layout.addRow("历史记录:", hist_layout)
+        self.auto_scale_check = QCheckBox(
+            "新粘贴/导入的图片按「缩放」输入框中的百分比自动缩放"
+        )
+        self.auto_scale_check.setToolTip(
+            "启用后，粘贴、导入或拖入的图片会直接按工具栏「缩放:」框中的百分比\n"
+            "放入，无需每次再点「统一缩放」。关闭则按原始尺寸放入。"
+        )
+        layout.addRow("自动缩放:", self.auto_scale_check)
         return widget
 
     def _build_performance_tab(self):
@@ -4829,6 +5569,7 @@ class SettingsDialog(QDialog):
         self.aa_check.setChecked(s.get("antialiasing", True))
         self.smooth_check.setChecked(s.get("smooth_pixmap", True))
         self.zoom_effect_check.setChecked(s.get("background_zoom", False))
+        self.auto_scale_check.setChecked(s.get("auto_scale_on_add", True))
 
     def _on_bg_type_changed(self, type_id):
         self.solid_frame.setVisible(type_id == 0)
@@ -4942,6 +5683,7 @@ class SettingsDialog(QDialog):
         result["antialiasing"] = self.aa_check.isChecked()
         result["smooth_pixmap"] = self.smooth_check.isChecked()
         result["background_zoom"] = self.zoom_effect_check.isChecked()
+        result["auto_scale_on_add"] = self.auto_scale_check.isChecked()
         return result
 
     def _on_apply(self):
@@ -5196,6 +5938,34 @@ class UndoManager:
         mw.schedule_autosave()
 
 
+# ==================== 缩放百分比输入框 ====================
+class ScaleSpinBox(QSpinBox):
+    """精确缩放百分比输入框：
+    编辑开始（点击/方向键/输入）时记录一次撤销快照，
+    避免连续拖动/输入时把整个中间过程刷进撤销栈"""
+    def __init__(self, mw):
+        super().__init__()
+        self._mw = mw
+        self._pushed = False
+
+    def _push_once(self):
+        if not self._pushed:
+            self._pushed = True
+            self._mw.push_undo()
+
+    def stepBy(self, steps):
+        self._push_once()
+        super().stepBy(steps)
+
+    def keyPressEvent(self, event):
+        self._push_once()
+        super().keyPressEvent(event)
+
+    def focusOutEvent(self, event):
+        self._pushed = False
+        super().focusOutEvent(event)
+
+
 # ==================== 主窗口 ====================
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -5223,6 +5993,9 @@ class MainWindow(QMainWindow):
         self._current_sel_image = None
         self._current_sel_start = None
         
+        # 多线程 Worker 管理
+        self._active_workers = []  # 跟踪活跃的 Worker，防止被 GC
+        
         self._autosave_timer = QTimer(self)
         self._autosave_timer.setSingleShot(True)
         self._autosave_timer.timeout.connect(self._do_autosave)
@@ -5236,13 +6009,22 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.view)
         self._toolbar_widgets = {}
         self._toolbar_actions = {}
-        self._build_toolbar()
-        self._build_statusbar()
         self._z_counter = 0
         self._global_opacity = 1.0
-        QTimer.singleShot(50, self.apply_toolbar_visibility)
-        self._try_restore_autosave()
+        self._build_statusbar()
+        # 工具栏构建和自动保存恢复延迟到窗口显示后执行
+        self._deferred_init_done = False
         self.scene.changed.connect(self._on_scene_changed)
+        self.scene.selectionChanged.connect(self._on_selection_changed)
+    
+    def deferred_init(self):
+        """窗口显示后执行的延迟初始化（避免启动卡顿）"""
+        if self._deferred_init_done:
+            return
+        self._deferred_init_done = True
+        self._build_toolbar()
+        self.apply_toolbar_visibility()
+        self._try_restore_autosave()
 
     def _set_app_icon(self):
         icon_path = os.path.join(os.path.dirname(__file__), "icon.ico")
@@ -5324,6 +6106,40 @@ class MainWindow(QMainWindow):
         act_reset = self._toolbar.addWidget(btn_reset)
         actions["btn_reset"] = act_reset
         widgets["btn_reset"] = btn_reset
+
+        lbl_scale_percent = QLabel("缩放:")
+        lbl_scale_percent.setToolTip("精确缩放选中图片到指定百分比")
+        act_lbl_scale_percent = self._toolbar.addWidget(lbl_scale_percent)
+        actions["lbl_scale_percent"] = act_lbl_scale_percent
+        widgets["lbl_scale_percent"] = lbl_scale_percent
+
+        spin_scale_percent = ScaleSpinBox(self)
+        spin_scale_percent.setRange(5, 500)
+        spin_scale_percent.setValue(100)
+        spin_scale_percent.setSuffix("%")
+        spin_scale_percent.setFixedWidth(70)
+        spin_scale_percent.setToolTip(
+            "精确缩放选中图片到指定百分比 (5%-500%)\n"
+            "· 输入数字后回车，或点击上下箭头/滚轮\n"
+            "· 选中单张/多张图片后输入，立即生效\n"
+            "· 配合「统一缩放」按钮可让全部图片使用同一比例"
+        )
+        spin_scale_percent.valueChanged.connect(self._on_scale_percent_changed)
+        act_spin_scale_percent = self._toolbar.addWidget(spin_scale_percent)
+        actions["spin_scale_percent"] = act_spin_scale_percent
+        widgets["spin_scale_percent"] = spin_scale_percent
+        self.spin_scale_percent = spin_scale_percent
+
+        btn_unify_scale = QPushButton("统一缩放")
+        btn_unify_scale.setToolTip(
+            "一键将所有图片统一缩放到「缩放」输入框中的百分比\n"
+            "用法：先在「缩放」框输入目标百分比（或选中一张图片读取其比例），\n"
+            "再点击本按钮，全部图片即统一为该比例"
+        )
+        btn_unify_scale.clicked.connect(self.unify_scale_all)
+        act_unify_scale = self._toolbar.addWidget(btn_unify_scale)
+        actions["btn_unify_scale"] = act_unify_scale
+        widgets["btn_unify_scale"] = btn_unify_scale
 
         sep2 = self._toolbar.addSeparator()
         actions["sep2"] = sep2
@@ -5664,6 +6480,8 @@ class MainWindow(QMainWindow):
         widget_keys = {
             "btn_import": "btn_import", "btn_paste": "btn_paste", "btn_undo": "btn_undo", "btn_del": "btn_del",
             "btn_zoom_in": "btn_zoom_in", "btn_zoom_out": "btn_zoom_out", "btn_reset": "btn_reset",
+            "lbl_scale_percent": "scale_percent", "spin_scale_percent": "scale_percent",
+            "btn_unify_scale": "btn_unify_scale",
             "btn_rot_left": "btn_rot_left", "btn_rot_right": "btn_rot_right",
             "btn_flip_h": "btn_flip_h", "btn_flip_v": "btn_flip_v",
             "btn_view_in": "btn_view_in", "btn_view_out": "btn_view_out", "btn_view_fit": "btn_view_fit",
@@ -5681,44 +6499,39 @@ class MainWindow(QMainWindow):
             "btn_save_hist": "btn_save_hist", "btn_history": "btn_history",
             "btn_export": "btn_export", "btn_clear": "btn_clear", "btn_settings": "btn_settings",
         }
-        sep_keys = ["sep1", "sep2", "sep3", "sep4", "sep5", "sep6", "sep7", "sep8", "sep9", "sep10", "sep11", "sep12", "sep13"]
+        sep_keys = {"sep1", "sep2", "sep3", "sep4", "sep5", "sep6", "sep7",
+                     "sep8", "sep9", "sep10", "sep11", "sep12", "sep13"}
         
-        for action_name, action in self._toolbar_actions.items():
-            if action_name in widget_keys:
-                key = widget_keys[action_name]
-                visible = visibility.get(key, True)
-                action.setVisible(visible)
-            elif action_name in sep_keys:
-                action.setVisible(True)
-        
+        # 一步构建有序项列表并设置可见性
         items_info = []
-        for name in self._toolbar_actions.keys():
-            action = self._toolbar_actions[name]
+        for name, action in self._toolbar_actions.items():
             is_sep = name in sep_keys
-            if is_sep:
-                items_info.append({"name": name, "type": "separator", "action": action})
-            else:
-                if name in widget_keys:
-                    key = widget_keys[name]
-                    visible = visibility.get(key, True)
-                else:
-                    visible = action.isVisible()
-                items_info.append({"name": name, "type": "widget", "action": action, "visible": visible})
+            info = {"action": action, "is_separator": is_sep, "visible": True}
+            if not is_sep:
+                key = widget_keys.get(name)
+                info["key"] = key
+                info["visible"] = visibility.get(key, True) if key else action.isVisible()
+                action.setVisible(info["visible"])
+            items_info.append(info)
         
+        # 单次扫描计算分隔符可见性：分隔符只在前后都有可见 widget 时才显示
+        n = len(items_info)
+        # 预计算每个位置之后第一个 widget 的可见性
+        next_visible = [False] * n
+        has_next = False
+        for i in range(n - 1, -1, -1):
+            if items_info[i]["is_separator"]:
+                next_visible[i] = has_next
+            else:
+                has_next = items_info[i]["visible"]
+        
+        has_prev = False
         for i, info in enumerate(items_info):
-            if info["type"] == "separator":
-                prev_visible = False
-                for j in range(i - 1, -1, -1):
-                    if items_info[j]["type"] == "widget":
-                        prev_visible = items_info[j]["visible"]
-                        break
-                next_visible = False
-                for j in range(i + 1, len(items_info)):
-                    if items_info[j]["type"] == "widget":
-                        next_visible = items_info[j]["visible"]
-                        break
-                sep_visible = prev_visible and next_visible
+            if info["is_separator"]:
+                sep_visible = has_prev and next_visible[i]
                 info["action"].setVisible(sep_visible)
+            else:
+                has_prev = info["visible"]
         
         self._toolbar.update()
         self._toolbar.repaint()
@@ -5741,6 +6554,7 @@ class MainWindow(QMainWindow):
         self.view_zoom_label.setText(f"视图: {zoom:.0%}")
 
     def update_status(self, item):
+        self.update_scale_percent_widget()
         if isinstance(item, MovableImageItem):
             pos = item.pos()
             size = item.original_size()
@@ -5822,6 +6636,12 @@ class MainWindow(QMainWindow):
     def _add_pixmap(self, pixmap, x=None, y=None):
         self.push_undo()
         item = MovableImageItem(pixmap)
+        # ✅ 若开启「自动缩放」，新粘贴/导入/拖入的图片按「缩放」输入框的百分比放入
+        if (self._settings.get("auto_scale_on_add", True)
+                and hasattr(self, "spin_scale_percent")):
+            percent = self.spin_scale_percent.value()
+            if percent > 0:
+                item.set_scale_factor(percent / 100.0)
         self._z_counter += 1
         item.setZValue(self._z_counter)
         item.setData(0, self._z_counter)
@@ -5970,6 +6790,56 @@ class MainWindow(QMainWindow):
                 self.update_status(item)
         self.schedule_autosave()
 
+    def _on_selection_changed(self):
+        """选中项变化时，同步缩放百分比输入框的显示值"""
+        self.update_scale_percent_widget()
+
+    def update_scale_percent_widget(self):
+        """把「缩放」输入框同步为当前选中图片的缩放百分比（多选时取第一张）"""
+        if not hasattr(self, "spin_scale_percent"):
+            return
+        selected = [i for i in self.scene.selectedItems()
+                    if isinstance(i, MovableImageItem)]
+        if selected:
+            value = int(round(selected[0].scale_factor() * 100))
+        else:
+            value = 100
+        self.spin_scale_percent.blockSignals(True)
+        self.spin_scale_percent.setValue(value)
+        self.spin_scale_percent.blockSignals(False)
+
+    def _on_scale_percent_changed(self, value):
+        """在「缩放」输入框输入/调整百分比时，精确缩放所有选中的图片"""
+        selected = [i for i in self.scene.selectedItems()
+                    if isinstance(i, MovableImageItem)]
+        if not selected:
+            return
+        factor = max(0.05, value / 100.0)
+        for item in selected:
+            item.set_scale_factor(factor)
+        self.update_status(selected[0])
+        self.schedule_autosave()
+
+    def unify_scale_all(self):
+        """一键将画布上所有图片统一缩放到「缩放」输入框中的百分比"""
+        items = [i for i in self.scene.items()
+                 if isinstance(i, MovableImageItem)]
+        if not items:
+            QMessageBox.information(self, "提示", "画布上没有图片。")
+            return
+        percent = self.spin_scale_percent.value()
+        if percent <= 0:
+            return
+        self.push_undo()
+        factor = max(0.05, percent / 100.0)
+        for item in items:
+            item.set_scale_factor(factor)
+        self.update_status(None)
+        self.schedule_autosave()
+        self.status_label.setText(
+            f"已将所有 {len(items)} 张图片统一缩放到 {percent}%"
+        )
+
     def rotate_selected(self, degrees):
         self.push_undo()
         for item in self.scene.selectedItems():
@@ -6070,35 +6940,78 @@ class MainWindow(QMainWindow):
         self._do_compare(selected)
 
     def _do_compare(self, selected):
-        """执行多图比对（按工具栏当前方案/阈值，结果实时上屏，不弹窗）"""
+        """执行多图比对（在后台线程运行，避免 UI 卡顿）"""
         threshold = int(self._settings.get("diff_threshold", 30))
         mode = self._settings.get("diff_mode", "rgb")
         self.clear_diff_markers()
+        
+        self.status_label.setText("正在比对差异...")
+        self.setEnabled(False)
+        
+        # 在主线程中提取图片数据（避免跨线程访问 GUI 对象）
         base_item = selected[0]
         base_img = base_item.original_pixmap().toImage().convertToFormat(QImage.Format_RGB32)
-        results = []
-        last_heat = None
+        compare_pairs = []
         for idx, other_item in enumerate(selected[1:], 1):
             other_img = other_item.original_pixmap().toImage().convertToFormat(QImage.Format_RGB32)
-            if base_img.size() != other_img.size():
-                other_img = other_img.scaled(
-                    base_img.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-                )
-            msg, regions, heat, ok = self._run_similarity(base_img, other_img, mode, threshold)
+            compare_pairs.append({
+                "idx": idx,
+                "other_item_id": id(other_item),
+                "base_img": base_img.copy(),
+                "other_img": other_img.copy(),
+            })
+        
+        # 创建后台线程执行比对
+        thread = QThread()
+        worker = _DiffComputeWorker(base_img, compare_pairs, mode, threshold, self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker._signals.finished.connect(lambda r: self._on_diff_computed(r, selected), Qt.QueuedConnection)
+        worker._signals.progress.connect(lambda msg: self.status_label.setText(msg), Qt.QueuedConnection)
+        worker._signals.error.connect(lambda msg: self._on_diff_error(msg), Qt.QueuedConnection)
+        worker._signals.finished.connect(lambda r: thread.quit(), Qt.QueuedConnection)
+        worker._signals.finished.connect(lambda r: self._cleanup_worker(worker), Qt.QueuedConnection)
+        worker._signals.error.connect(lambda r: thread.quit(), Qt.QueuedConnection)
+        thread.finished.connect(thread.deleteLater)
+        self._active_workers.append(worker)
+        thread.start()
+    
+    def _on_diff_computed(self, results, selected):
+        """差异比对计算完成回调（主线程），将结果绘制到场景"""
+        self.setEnabled(True)
+        display_mode = self._heatmap_display_mode()
+        show_markers = display_mode in ("both", "marker_only")
+        show_heatmap = display_mode in ("both", "heat_only")
+        
+        msgs = []
+        last_heat = None
+        for data in results:
+            idx = data["idx"]
+            other_item = data["other_item"]
+            msg = data["msg"]
+            regions = data["regions"]
+            heat = data["heat"]
+            
             last_heat = heat
-            display_mode = self._heatmap_display_mode()
-            show_markers = display_mode in ("both", "marker_only")
-            show_heatmap = display_mode in ("both", "heat_only")
-            if regions and show_markers:
+            
+            if regions and show_markers and other_item and other_item.scene():
                 overlay = DiffOverlay(other_item)
                 overlay.set_diff_rects(self._diff_local_rects(other_item, regions))
                 self._diff_markers.append(overlay)
-            if heat is not None and not heat.isNull() and show_heatmap:
+            
+            if heat is not None and not heat.isNull() and show_heatmap and other_item and other_item.scene():
                 hv = HeatmapOverlay(other_item, heat)
                 hv.setOpacity(self._settings.get("heatmap_opacity", 50) / 100.0)
                 self._heatmap_overlays.append(hv)
-            results.append(f"第{idx}张:\n{msg}")
-        self._show_similarity_result("\n\n".join(results), last_heat)
+            
+            msgs.append(f"第{idx}张:\n{msg}")
+        
+        self._show_similarity_result("\n\n".join(msgs), last_heat)
+    
+    def _on_diff_error(self, msg):
+        """差异比对错误回调"""
+        self.setEnabled(True)
+        self.status_label.setText(f"比对失败: {msg}")
 
     def _luma_bytes(self, img):
         """转为灰度（每像素1字节），返回 (字节数组, bytesPerLine)"""
@@ -6871,18 +7784,23 @@ class MainWindow(QMainWindow):
             self._draw_path.moveTo(local_pos)
             self._preview_path_index = len(overlay._paths)
             overlay._paths.append(QPainterPath())
+            overlay._path_colors.append(self._marker_tool.color.name())
         elif self._marker_tool.mode == MarkerTool.MODE_LINE:
             self._preview_line_index = len(overlay._lines)
             overlay._lines.append((local_pos, local_pos))
+            overlay._line_colors.append(self._marker_tool.color.name())
         elif self._marker_tool.mode == MarkerTool.MODE_RECT:
             self._preview_rect_index = len(overlay._rects)
             overlay._rects.append(QRectF(local_pos, local_pos))
+            overlay._rect_colors.append(self._marker_tool.color.name())
         elif self._marker_tool.mode == MarkerTool.MODE_ELLIPSE:
             self._preview_ellipse_index = len(overlay._ellipses)
             overlay._ellipses.append(QRectF(local_pos, local_pos))
+            overlay._ellipse_colors.append(self._marker_tool.color.name())
         elif self._marker_tool.mode == MarkerTool.MODE_ARROW:
             self._preview_arrow_index = len(overlay._arrows)
             overlay._arrows.append((local_pos, local_pos))
+            overlay._arrow_colors.append(self._marker_tool.color.name())
         elif self._marker_tool.mode == MarkerTool.MODE_TEXT:
             text = self._marker_tool.text or "标记"
             overlay.add_text(local_pos, text)
@@ -7129,20 +8047,167 @@ class MainWindow(QMainWindow):
         if any(isinstance(i, MovableImageItem) for i in selected):
             self.schedule_autosave()
 
-    def _do_autosave(self):
+    def _do_autosave(self, sync=False):
+        # ✅ 在主线程预提取所有数据，Worker 线程只做文件 I/O，不访问任何 QObject
+        # sync=True 时直接在调用线程写入文件（用于 closeEvent 等必须等待完成的场景）
         items = [i for i in self.scene.items() if isinstance(i, MovableImageItem) or isinstance(i, EmojiItem)]
-        try:
-            self._marker_manager.save_all_markers(
-                [i for i in items if isinstance(i, MovableImageItem)]
-            )
-            self._autosave_mgr.save_state(items)
-        except Exception as e:
-            print(f"自动保存失败: {e}")
+        if not items:
+            # 画布为空，清除旧的自动保存文件，避免下次启动恢复旧内容
+            self._autosave_mgr.clear_autosave()
+            return
+        
+        # 保存标记（在主线程完成，因为需要访问 QGraphicsItem）
+        self._marker_manager.save_all_markers(
+            [i for i in items if isinstance(i, MovableImageItem)]
+        )
+        
+        images_data = []
+        emojis_data = []
+        orphan_emojis = []
+        
+        for item in items:
+            if isinstance(item, MovableImageItem):
+                iid = item.item_id()
+                # 预提取 pixmap 为 PNG 字节数据（在主线程安全操作）
+                pixmap = item.original_pixmap()
+                ba = QByteArray()
+                buf = QBuffer(ba)
+                buf.open(QBuffer.WriteOnly)
+                pixmap.save(buf, "PNG")
+                pixmap_bytes = bytes(ba)
+                
+                info = item.to_dict()
+                info["image_file"] = f"{iid}.png"
+                images_data.append({
+                    "iid": iid,
+                    "pixmap_bytes": pixmap_bytes,
+                    "info_dict": info,
+                })
+                
+                # 预提取 Emoji 数据
+                attached = item.get_attached_emojis()
+                emoji_list = []
+                for emoji in attached:
+                    emoji_list.append({
+                        "id": emoji.item_id(),
+                        "emoji": emoji._emoji_char,
+                        "font_size": emoji._font_size,
+                        "scale": emoji.get_scale_factor(),
+                        "pos": {"x": emoji.pos().x(), "y": emoji.pos().y()},
+                        "z": emoji.zValue(),
+                    })
+                emojis_data.append({"iid": iid, "emojis_list": emoji_list})
+                
+            elif isinstance(item, EmojiItem):
+                if item.get_parent_image() is None:
+                    orphan_emojis.append(item.to_dict())
+        
+        worker = SaveWorker("autosave", {
+            "images_data": images_data,
+            "emojis_data": emojis_data,
+            "orphan_emojis": orphan_emojis,
+            "state_file": self._autosave_mgr.state_file,
+            "images_dir": self._autosave_mgr.images_dir,
+            "emojis_dir": EMOJIS_DIR,
+        })
+        if sync:
+            # 同步模式：直接在调用线程中执行保存（用于 closeEvent 等必须等待完成的场景）
+            worker._do_autosave()
+        else:
+            # 异步模式：后台线程保存（常规自动保存）
+            worker._signals.error.connect(lambda msg: print(f"自动保存失败: {msg}"), Qt.QueuedConnection)
+            worker._signals.finished.connect(lambda r: self._cleanup_worker(worker), Qt.QueuedConnection)
+            self._active_workers.append(worker)
+            worker.start()
+    
+    def _cleanup_worker(self, worker):
+        """清理已完成的 Worker（延迟执行，确保线程完全结束）"""
+        # 延迟到下一轮事件循环，确保 Worker 线程的 run() 已完全返回
+        QTimer.singleShot(0, lambda w=worker: self._safe_remove_worker(w))
+    
+    def _safe_remove_worker(self, worker):
+        if worker in self._active_workers:
+            self._active_workers.remove(worker)
 
     def _try_restore_autosave(self):
         if not self._autosave_mgr.has_autosave():
             return
-        count = self._autosave_mgr.load_state(self.scene, self._on_item_added)
+        
+        self.status_label.setText("正在恢复上次画面...")
+        
+        worker = LoadWorker("autosave", {
+            "autosave_mgr": self._autosave_mgr,
+        })
+        worker._signals.progress.connect(lambda msg: self.status_label.setText(msg), Qt.QueuedConnection)
+        worker._signals.finished.connect(lambda result: self._on_autosave_loaded(result), Qt.QueuedConnection)
+        worker._signals.error.connect(lambda msg: self.status_label.setText(f"恢复失败: {msg}"), Qt.QueuedConnection)
+        worker._signals.finished.connect(lambda r: self._cleanup_worker(worker), Qt.QueuedConnection)
+        self._active_workers.append(worker)
+        worker.start()
+    
+    def _on_autosave_loaded(self, result):
+        """自动保存数据加载完成后的 UI 更新（在主线程执行）"""
+        image_data = result.get("images", [])
+        emoji_data = result.get("emojis", [])
+        orphans = result.get("orphans", [])
+        
+        image_items = {}
+        for data in image_data:
+            # ✅ 在主线程从字节数据创建 QPixmap（安全）
+            pixmap = QPixmap()
+            pixmap.loadFromData(data["img_bytes"])
+            if pixmap.isNull():
+                continue
+            info = data["info"]
+            item = MovableImageItem(pixmap, item_id=data["item_id"])
+            item.set_scale_factor(data["scale"])
+            item.set_opacity_value(data["opacity"])
+            z = data["z"]
+            item.setZValue(z)
+            item.setData(0, z)
+            pos = data["pos"]
+            item.setPos(pos.get("x", 0), pos.get("y", 0))
+            item.set_rotation_deg(data["rotation"])
+            if data["flipped_h"]:
+                item.flip_horizontal()
+            if data["flipped_v"]:
+                item.flip_vertical()
+            self.scene.addItem(item)
+            self._on_item_added(item)
+            image_items[data["item_id"]] = item
+        
+        # 恢复 Emoji
+        for ed in emoji_data:
+            parent_item = image_items.get(ed["parent_id"])
+            if parent_item:
+                for d in ed["emojis"]:
+                    emoji = EmojiItem(
+                        d.get("emoji", "😀"),
+                        font_size=d.get("font_size", 48),
+                        item_id=d.get("id")
+                    )
+                    emoji.set_scale_factor(d.get("scale", 1.0))
+                    pos = d.get("pos", {})
+                    emoji._parent_image = parent_item
+                    emoji.setParentItem(parent_item)
+                    emoji.setPos(pos.get("x", 0), pos.get("y", 0))
+                    emoji.setZValue(d.get("z", 100))
+                    parent_item._attached_emojis.append(emoji)
+        
+        # 恢复独立 Emoji
+        for d in orphans:
+            emoji = EmojiItem(
+                d.get("emoji", "😀"),
+                font_size=d.get("font_size", 48),
+                item_id=d.get("id")
+            )
+            emoji.set_scale_factor(d.get("scale", 1.0))
+            pos = d.get("pos", {})
+            emoji.setPos(pos.get("x", 0), pos.get("y", 0))
+            emoji.setZValue(d.get("z", 100))
+            self.scene.addItem(emoji)
+        
+        count = result.get("count", 0) + len(emoji_data) + len(orphans)
         if count > 0:
             QTimer.singleShot(200, self._restore_all_markers)
             self.status_label.setText(f"已自动恢复上次画面，共 {count} 个元素")
@@ -7189,11 +8254,153 @@ class MainWindow(QMainWindow):
         if not items:
             QMessageBox.information(self, "提示", "画布上没有内容，无法保存到历史记录。")
             return
+        
+        self.status_label.setText("正在保存历史记录...")
+        self.setEnabled(False)
+        
+        # 保存标记（快速操作，主线程完成）
         self._marker_manager.save_all_markers(
             [i for i in items if isinstance(i, MovableImageItem)]
         )
-        hid = self._history_mgr.save_history(items)
+        
+        # ✅ 在主线程预提取所有数据，Worker 线程只做文件 I/O
+        hid = str(uuid.uuid4())[:8]
+        ts = time.time()
+        title = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+        state_dir = os.path.join(HISTORY_DIR, hid)
+        
+        images_data = []
+        emoji_data = []
+        marker_data = []
+        orphan_emojis = []
+        
+        movable_items = [i for i in items if isinstance(i, MovableImageItem)]
+        
+        for item in movable_items:
+            iid = item.item_id()
+            # 预提取 pixmap 为 PNG 字节数据
+            pixmap = item.original_pixmap()
+            ba = QByteArray()
+            buf = QBuffer(ba)
+            buf.open(QBuffer.WriteOnly)
+            pixmap.save(buf, "PNG")
+            pixmap_bytes = bytes(ba)
+            
+            info = item.to_dict()
+            info["image_file"] = f"{iid}.png"
+            
+            # 收集标记文件数据
+            marker_file = os.path.join(MARKERS_DIR, f"{iid}.json")
+            if os.path.exists(marker_file):
+                try:
+                    with open(marker_file, "rb") as f:
+                        marker_data.append({
+                            "dest_name": f"marker_{iid}.json",
+                            "data": f.read()
+                        })
+                    info["has_marker"] = True
+                    info["marker_file"] = f"marker_{iid}.json"
+                except Exception as e:
+                    print(f"读取标记文件失败: {e}")
+                    info["has_marker"] = False
+            else:
+                info["has_marker"] = False
+            
+            # 收集 Emoji 文件数据
+            emoji_file_src = os.path.join(EMOJIS_DIR, f"{iid}.json")
+            if os.path.exists(emoji_file_src):
+                try:
+                    with open(emoji_file_src, "rb") as f:
+                        emoji_data.append({
+                            "dest_name": f"emoji_{iid}.json",
+                            "data": f.read()
+                        })
+                    info["has_emojis"] = True
+                    info["emoji_file"] = f"emoji_{iid}.json"
+                except Exception as e:
+                    print(f"读取 Emoji 文件失败: {e}")
+                    info["has_emojis"] = False
+            else:
+                info["has_emojis"] = False
+            
+            images_data.append({
+                "iid": iid,
+                "pixmap_bytes": pixmap_bytes,
+                "info_dict": info,
+            })
+        
+        # 收集独立 Emoji
+        for item in items:
+            if isinstance(item, EmojiItem) and not item.get_parent_image():
+                orphan_emojis.append(item.to_dict())
+        
+        # 收集 orphans 文件数据
+        orphans_data = None
+        orphans_file = os.path.join(EMOJIS_DIR, "orphans.json")
+        if os.path.exists(orphans_file):
+            try:
+                with open(orphans_file, "rb") as f:
+                    orphans_data = f.read()
+            except:
+                pass
+        
+        # 在 UI 线程生成缩略图
+        thumb_bytes = self._generate_thumbnail_bytes(400)
+        
+        # 使用后台线程保存
+        worker = SaveWorker("history", {
+            "hid": hid,
+            "title": title,
+            "timestamp": ts,
+            "state_dir": state_dir,
+            "images_data": images_data,
+            "emoji_files": emoji_data,
+            "marker_files": marker_data,
+            "orphan_emojis": orphan_emojis,
+            "orphans_data": orphans_data,
+            "thumb_bytes": thumb_bytes,
+            "max_history": self._settings.get_max_history(),
+            "history_dir": HISTORY_DIR,
+            "history_mgr": self._history_mgr,
+        })
+        worker._signals.progress.connect(lambda msg: self.status_label.setText(msg), Qt.QueuedConnection)
+        worker._signals.finished.connect(lambda r: self._on_history_saved(), Qt.QueuedConnection)
+        worker._signals.error.connect(lambda msg: self._on_history_save_error(msg), Qt.QueuedConnection)
+        worker._signals.finished.connect(lambda r: self._cleanup_worker(worker), Qt.QueuedConnection)
+        self._active_workers.append(worker)
+        worker.start()
+    
+    def _on_history_saved(self):
+        """历史保存完成回调"""
+        self.setEnabled(True)
         QMessageBox.information(self, "已保存", "当前画面已保存到历史记录。")
+        self.status_label.setText("历史记录已保存")
+    
+    def _on_history_save_error(self, msg):
+        """历史保存错误回调"""
+        self.setEnabled(True)
+        QMessageBox.warning(self, "保存失败", f"保存历史记录失败: {msg}")
+        self.status_label.setText(f"保存失败: {msg}")
+
+    def _generate_thumbnail_bytes(self, max_size=400):
+        """在主线程生成缩略图的 PNG 字节数据"""
+        try:
+            viewport_rect = self.view.viewport().rect()
+            screenshot = self.view.grab(viewport_rect)
+            if not screenshot.isNull():
+                scaled = screenshot.scaled(
+                    max_size, max_size,
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation
+                )
+                ba = QByteArray()
+                buf = QBuffer(ba)
+                buf.open(QBuffer.WriteOnly)
+                scaled.save(buf, "PNG")
+                return bytes(ba)
+        except Exception:
+            pass
+        return None
 
     def show_history(self):
         dlg = HistoryDialog(self._history_mgr, self)
@@ -7203,13 +8410,122 @@ class MainWindow(QMainWindow):
                 self._load_history(hid)
 
     def _load_history(self, hid):
+        # 清除当前场景
         for item in list(self.scene.items()):
             if isinstance(item, MovableImageItem) or isinstance(item, DiffMarkerItem) or isinstance(item, MarkerOverlay) or isinstance(item, EmojiItem):
                 self.scene.removeItem(item)
         self._diff_markers = []
         self._marker_manager.clear_all_markers()
-        count = self._history_mgr.load_history(hid, self.scene, self._on_item_added)
         self.clear_diff_markers()
+        
+        self.status_label.setText("正在加载历史记录...")
+        self.setEnabled(False)
+        
+        worker = LoadWorker("history", {
+            "hid": hid,
+            "history_mgr": self._history_mgr,
+        })
+        worker._signals.progress.connect(lambda msg: self.status_label.setText(msg), Qt.QueuedConnection)
+        worker._signals.finished.connect(lambda result: self._on_history_loaded(result), Qt.QueuedConnection)
+        worker._signals.error.connect(lambda msg: self._on_history_load_error(msg), Qt.QueuedConnection)
+        worker._signals.finished.connect(lambda r: self._cleanup_worker(worker), Qt.QueuedConnection)
+        self._active_workers.append(worker)
+        worker.start()
+    
+    def _on_history_loaded(self, result):
+        """历史记录加载完成回调（主线程）"""
+        self.setEnabled(True)
+        image_data = result.get("images", [])
+        emoji_data = result.get("emojis", [])
+        orphans = result.get("orphans", [])
+        state_dir = result.get("state_dir", "")
+        
+        image_items = {}
+        for data in image_data:
+            # ✅ 在主线程从字节数据创建 QPixmap（安全）
+            pixmap = QPixmap()
+            pixmap.loadFromData(data["img_bytes"])
+            if pixmap.isNull():
+                continue
+            info = data["info"]
+            item = MovableImageItem(pixmap, item_id=data["item_id"])
+            item.set_scale_factor(data["scale"])
+            item.set_opacity_value(data["opacity"])
+            z = data["z"]
+            item.setZValue(z)
+            item.setData(0, z)
+            pos = data["pos"]
+            item.setPos(pos.get("x", 0), pos.get("y", 0))
+            item.set_rotation_deg(data["rotation"])
+            if data["flipped_h"]:
+                item.flip_horizontal()
+            if data["flipped_v"]:
+                item.flip_vertical()
+            self.scene.addItem(item)
+            self._on_item_added(item)
+            image_items[data["item_id"]] = item
+            
+            # 恢复标记
+            if data.get("has_marker") and data.get("marker_file") and state_dir:
+                src_marker = os.path.join(state_dir, data["marker_file"])
+                if os.path.exists(src_marker):
+                    try:
+                        dest_marker = os.path.join(MARKERS_DIR, f"{data['item_id']}.json")
+                        if os.path.exists(dest_marker):
+                            try:
+                                os.remove(dest_marker)
+                            except:
+                                pass
+                        shutil.copy2(src_marker, dest_marker)
+                    except:
+                        pass
+        
+        # 恢复 Emoji
+        for ed in emoji_data:
+            parent_item = image_items.get(ed["parent_id"])
+            if parent_item:
+                # 先恢复 Emoji 文件
+                src_emoji = os.path.join(state_dir, f"emoji_{ed['parent_id']}.json")
+                dest_emoji = os.path.join(EMOJIS_DIR, f"{ed['parent_id']}.json")
+                if os.path.exists(src_emoji):
+                    try:
+                        shutil.copy2(src_emoji, dest_emoji)
+                    except:
+                        pass
+                for d in ed["emojis"]:
+                    emoji = EmojiItem(
+                        d.get("emoji", "😀"),
+                        font_size=d.get("font_size", 48),
+                        item_id=d.get("id")
+                    )
+                    emoji.set_scale_factor(d.get("scale", 1.0))
+                    pos = d.get("pos", {})
+                    emoji._parent_image = parent_item
+                    emoji.setParentItem(parent_item)
+                    emoji.setPos(pos.get("x", 0), pos.get("y", 0))
+                    emoji.setZValue(d.get("z", 100))
+                    parent_item._attached_emojis.append(emoji)
+        
+        # 恢复独立 Emoji
+        orphans_src = os.path.join(state_dir, "orphans.json")
+        if os.path.exists(orphans_src):
+            try:
+                shutil.copy2(orphans_src, os.path.join(EMOJIS_DIR, "orphans.json"))
+            except:
+                pass
+        for d in orphans:
+            emoji = EmojiItem(
+                d.get("emoji", "😀"),
+                font_size=d.get("font_size", 48),
+                item_id=d.get("id")
+            )
+            emoji.set_scale_factor(d.get("scale", 1.0))
+            pos = d.get("pos", {})
+            emoji.setPos(pos.get("x", 0), pos.get("y", 0))
+            emoji.setZValue(d.get("z", 100))
+            self.scene.addItem(emoji)
+        
+        count = result.get("count", 0) + len(emoji_data) + len(orphans)
         if count > 0:
             for item in self.scene.items():
                 if isinstance(item, MovableImageItem):
@@ -7219,6 +8535,13 @@ class MainWindow(QMainWindow):
             self.schedule_autosave()
         else:
             QMessageBox.warning(self, "失败", "加载历史记录失败。")
+            self.status_label.setText("加载历史记录失败")
+    
+    def _on_history_load_error(self, msg):
+        """历史加载错误回调"""
+        self.setEnabled(True)
+        QMessageBox.warning(self, "失败", f"加载历史记录失败: {msg}")
+        self.status_label.setText(f"加载失败: {msg}")
 
     # ==================== 导出相关 ====================
 
@@ -7246,20 +8569,21 @@ class MainWindow(QMainWindow):
             )
             if reply != QMessageBox.Yes:
                 return
-        result = QImage(total_w, total_h, QImage.Format_ARGB32)
-        result.fill(Qt.transparent)
-        painter = QPainter(result)
-        settings = SettingsManager()
-        if settings.get("antialiasing", True):
-            painter.setRenderHint(QPainter.Antialiasing)
-        if settings.get("smooth_pixmap", True):
-            painter.setRenderHint(QPainter.SmoothPixmapTransform)
         
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "导出拼接大图", ProjectInfo.get_export_default_filename(),
+            "PNG 图片 (支持透明) (*.png);;JPEG 图片 (*.jpg);;BMP 图片 (*.bmp)"
+        )
+        if not save_path:
+            return
+        
+        ext = os.path.splitext(save_path)[1].lower()
+        
+        # 在主线程中序列化场景数据（避免跨线程访问 GUI 对象）
+        scene_items_data = []
         draw_items = []
         for item in self.scene.items():
             if isinstance(item, MovableImageItem):
-                draw_items.append(item)
-            elif isinstance(item, MarkerOverlay):
                 draw_items.append(item)
             elif isinstance(item, EmojiItem):
                 draw_items.append(item)
@@ -7268,62 +8592,57 @@ class MainWindow(QMainWindow):
         for item in sorted_items:
             if isinstance(item, MovableImageItem):
                 rect = item.sceneBoundingRect()
-                cx = rect.center().x() - min_x + margin
-                cy = rect.center().y() - min_y + margin
-                painter.save()
-                painter.translate(cx, cy)
-                painter.rotate(item.rotation_value())
-                painter.setOpacity(item.opacity_value() * self._global_opacity)
-                pw = item.pixmap().width()
-                ph = item.pixmap().height()
-                painter.drawPixmap(-pw / 2, -ph / 2, item.pixmap())
-                painter.restore()
-            elif isinstance(item, MarkerOverlay):
-                parent_item = item._parent_item
-                if parent_item and parent_item.scene():
-                    rect = parent_item.sceneBoundingRect()
-                    cx = rect.center().x() - min_x + margin
-                    cy = rect.center().y() - min_y + margin
-                    painter.save()
-                    painter.translate(cx, cy)
-                    painter.rotate(parent_item.rotation_value())
-                    painter.setOpacity(parent_item.opacity_value() * self._global_opacity)
-                    item.paint(painter, None, None)
-                    painter.restore()
+                scene_items_data.append({
+                    "type": "image",
+                    "rect": QRectF(rect),
+                    "rotation": item.rotation_value(),
+                    "opacity": item.opacity_value(),
+                    "pixmap": item.pixmap().copy(),  # 深拷贝避免跨线程问题
+                })
             elif isinstance(item, EmojiItem):
                 rect = item.sceneBoundingRect()
-                cx = rect.center().x() - min_x + margin
-                cy = rect.center().y() - min_y + margin
-                painter.save()
-                painter.translate(cx, cy)
-                painter.drawPixmap(
-                    -item.pixmap().width() / 2,
-                    -item.pixmap().height() / 2,
-                    item.pixmap()
-                )
-                painter.restore()
+                scene_items_data.append({
+                    "type": "emoji",
+                    "rect": QRectF(rect),
+                    "pixmap": item.pixmap().copy(),
+                })
         
-        painter.end()
-        save_path, _ = QFileDialog.getSaveFileName(
-            self, "导出拼接大图", ProjectInfo.get_export_default_filename(),
-            "PNG 图片 (支持透明) (*.png);;JPEG 图片 (*.jpg);;BMP 图片 (*.bmp)"
+        # 启动后台导出线程
+        self.status_label.setText("正在导出...")
+        self.setEnabled(False)  # 导出期间禁用窗口操作
+        
+        worker = ExportWorker(
+            scene_items_data,
+            export_rect=(min_x, min_y, margin),
+            result_size=(total_w, total_h),
+            output_path=save_path,
+            ext=ext,
+            global_opacity=self._global_opacity,
+            antialiasing=self._settings.get("antialiasing", True),
+            smooth_pixmap=self._settings.get("smooth_pixmap", True),
         )
-        if not save_path:
-            return
-        ext = os.path.splitext(save_path)[1].lower()
-        if ext in (".jpg", ".jpeg"):
-            bg = QImage(result.size(), QImage.Format_RGB32)
-            bg.fill(Qt.white)
-            p = QPainter(bg)
-            p.drawImage(0, 0, result)
-            p.end()
-            bg.save(save_path, quality=95)
-        else:
-            result.save(save_path)
-        QMessageBox.information(
-            self, "成功",
-            f"已导出到:\n{save_path}\n尺寸: {total_w}x{total_h}"
-        )
+        worker._signals.progress.connect(lambda msg: self.status_label.setText(msg), Qt.QueuedConnection)
+        worker._signals.finished.connect(lambda r: self._on_export_finished(r), Qt.QueuedConnection)
+        worker._signals.error.connect(lambda msg: self._on_export_error(msg), Qt.QueuedConnection)
+        worker._signals.finished.connect(lambda r: self._cleanup_worker(worker), Qt.QueuedConnection)
+        self._active_workers.append(worker)
+        worker.start()
+    
+    def _on_export_finished(self, result):
+        """导出完成回调（主线程）"""
+        self.setEnabled(True)
+        if result:
+            QMessageBox.information(
+                self, "成功",
+                f"已导出到:\n{result['path']}\n尺寸: {result['width']}x{result['height']}"
+            )
+            self.status_label.setText("导出完成")
+    
+    def _on_export_error(self, msg):
+        """导出错误回调（主线程）"""
+        self.setEnabled(True)
+        QMessageBox.critical(self, "导出失败", msg)
+        self.status_label.setText(f"导出失败: {msg}")
 
     # ==================== 键盘事件 ====================
 
@@ -7398,6 +8717,17 @@ class MainWindow(QMainWindow):
         super().keyReleaseEvent(event)
 
     def closeEvent(self, event):
+        # 等待所有活跃的后台线程完成
+        if self._active_workers:
+            self.status_label.setText("正在等待后台任务完成...")
+            for worker in list(self._active_workers):
+                try:
+                    if worker._thread and worker._thread.isRunning():
+                        worker._thread.quit()
+                        worker._thread.wait(2000)  # 最多等待2秒
+                except RuntimeError:
+                    pass  # 线程对象已被删除，忽略
+        
         items = [i for i in self.scene.items() if isinstance(i, MovableImageItem) or isinstance(i, EmojiItem)]
         self._marker_manager.save_all_markers(
             [i for i in items if isinstance(i, MovableImageItem)]
@@ -7408,7 +8738,7 @@ class MainWindow(QMainWindow):
                 self._autosave_mgr._save_emojis_for_item(item)
             elif isinstance(item, EmojiItem) and not item.get_parent_image():
                 self._save_orphan_emoji(item)
-        self._do_autosave()
+        self._do_autosave(sync=True)  # 同步保存，确保关窗前完成写入
         if self._marker_dialog:
             self._marker_dialog.close()
         super().closeEvent(event)
@@ -7424,6 +8754,8 @@ def main():
     window = MainWindow()
     window.show()
     window.view.centerOn(0, 0)
+    # 窗口显示后再执行重型初始化（工具栏构建、自动保存恢复等），避免启动卡顿
+    QTimer.singleShot(0, window.deferred_init)
     sys.exit(app.exec())
 
 

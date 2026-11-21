@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "timestamp": 1784965554.1622329,
+  "images": [
+    {
+      "id": "30ff6118",
+      "pos": {
+        "x": 865.7933648085875,
+        "y": -173.9499600780752
+      },
+      "scale": 0.7107920286291652,
+      "opacity": 1.0,
+      "rotation": 0.0,
+      "flipped_h": false,
+      "flipped_v": false,
+      "z": 1000.0,
+      "image_file": "30ff6118.png"
+    },
+    {
+      "id": "9ff53bb4",
+      "pos": {
+        "x": -281.67688547671554,
+        "y": -180.4281690411209
+      },
+      "scale": 1.0566556110000007,
+      "opacity": 1.0,
+      "rotation": 0.0,
+      "flipped_h": false,
+      "flipped_v": false,
+      "z": 1000.0,
+      "image_file": "9ff53bb4.png"
+    },
+    {
+      "id": "0758c0e2",
+      "pos": {
+        "x": 306.8294035342305,
+        "y": -177.7649963901417
+      },
+      "scale": 1.2973200898483197,
+      "opacity": 1.0,
+      "rotation": 0.0,
+      "flipped_h": false,
+      "flipped_v": false,
+      "z": 2.0,
+      "image_file": "0758c0e2.png"
+    }
+  ]
+}

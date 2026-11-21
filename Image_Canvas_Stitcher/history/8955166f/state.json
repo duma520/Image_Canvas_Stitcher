@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "timestamp": 1788273830.5759952,
+  "images": [
+    {
+      "id": "f157ffb4",
+      "pos": {
+        "x": 880.3799999999997,
+        "y": -374.6149999999999
+      },
+      "scale": 1.0,
+      "opacity": 1.0,
+      "rotation": 0.0,
+      "flipped_h": false,
+      "flipped_v": false,
+      "z": 1000.0,
+      "attached_emojis": [],
+      "image_file": "f157ffb4.png",
+      "has_marker": false,
+      "has_emojis": false
+    },
+    {
+      "id": "911918fa",
+      "pos": {
+        "x": 747.4199999999998,
+        "y": -391.7124999999999
+      },
+      "scale": 1.0,
+      "opacity": 1.0,
+      "rotation": 0.0,
+      "flipped_h": false,
+      "flipped_v": false,
+      "z": 4.0,
+      "attached_emojis": [],
+      "image_file": "911918fa.png",
+      "has_marker": false,
+      "has_emojis": false
+    },
+    {
+      "id": "2e1b44e8",
+      "pos": {
+        "x": -577.9292421874396,
+        "y": 310.1165482295481
+      },
+      "scale": 0.8820900000000003,
+      "opacity": 1.0,
+      "rotation": 0.0,
+      "flipped_h": false,
+      "flipped_v": false,
+      "z": 3.0,
+      "attached_emojis": [],
+      "image_file": "2e1b44e8.png",
+      "has_marker": false,
+      "has_emojis": false
+    },
+    {
+      "id": "6b1257e8",
+      "pos": {
+        "x": -620.0,
+        "y": -365.5
+      },
+      "scale": 1.0,
+      "opacity": 1.0,
+      "rotation": 0.0,
+      "flipped_h": false,
+      "flipped_v": false,
+      "z": 2.0,
+      "attached_emojis": [],
+      "image_file": "6b1257e8.png",
+      "has_marker": false,
+      "has_emojis": false
+    }
+  ],
+  "emojis": []
+}

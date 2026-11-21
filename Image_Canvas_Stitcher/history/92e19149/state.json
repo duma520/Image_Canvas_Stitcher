@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "timestamp": 1787409682.1381242,
+  "images": [
+    {
+      "id": "dc816130",
+      "pos": {
+        "x": -786.9292291666666,
+        "y": -423.41771695940093
+      },
+      "scale": 0.8820900000000003,
+      "opacity": 1.0,
+      "rotation": 0.0,
+      "flipped_h": false,
+      "flipped_v": false,
+      "z": 9.0,
+      "attached_emojis": [],
+      "image_file": "dc816130.png",
+      "has_marker": false,
+      "has_emojis": false
+    }
+  ],
+  "emojis": []
+}

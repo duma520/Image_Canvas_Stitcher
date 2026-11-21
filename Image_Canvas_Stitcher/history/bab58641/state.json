@@ -1,0 +1,116 @@
+{
+  "version": 1,
+  "timestamp": 1785500721.4075823,
+  "images": [
+    {
+      "id": "ca43555a",
+      "pos": {
+        "x": -133.99102557818583,
+        "y": 347.7966602456911
+      },
+      "scale": 1.1,
+      "opacity": 1.0,
+      "rotation": 0.0,
+      "flipped_h": false,
+      "flipped_v": false,
+      "z": 1009.0,
+      "attached_emojis": [],
+      "image_file": "ca43555a.png",
+      "has_marker": false,
+      "has_emojis": false
+    },
+    {
+      "id": "32f4fb8e",
+      "pos": {
+        "x": -429.93860798894514,
+        "y": -529.2549760652497
+      },
+      "scale": 1.0,
+      "opacity": 1.0,
+      "rotation": 0.0,
+      "flipped_h": false,
+      "flipped_v": false,
+      "z": 1008.0,
+      "attached_emojis": [],
+      "image_file": "32f4fb8e.png",
+      "has_marker": false,
+      "has_emojis": false
+    },
+    {
+      "id": "e5947c44",
+      "pos": {
+        "x": 826.3503407199705,
+        "y": -1047.569324751348
+      },
+      "scale": 2.132485625548802,
+      "opacity": 1.0,
+      "rotation": 0.0,
+      "flipped_h": false,
+      "flipped_v": false,
+      "z": 1000.0,
+      "attached_emojis": [
+        {
+          "id": "a578247b",
+          "emoji": "🔒",
+          "font_size": 48,
+          "scale": 1.0,
+          "pos": {
+            "x": 1732.7217014325556,
+            "y": 720.1215313765128
+          },
+          "z": 100.0
+        },
+        {
+          "id": "d2ec33bd",
+          "emoji": "🔒",
+          "font_size": 48,
+          "scale": 1.0,
+          "pos": {
+            "x": 2157.7671201494472,
+            "y": 425.3617736141465
+          },
+          "z": 100.0
+        },
+        {
+          "id": "f4bde79b",
+          "emoji": "😺",
+          "font_size": 48,
+          "scale": 1.0,
+          "pos": {
+            "x": 2480.247231306393,
+            "y": 478.03044506384833
+          },
+          "z": 100.0
+        },
+        {
+          "id": "a6652c7e",
+          "emoji": "😺",
+          "font_size": 48,
+          "scale": 1.0,
+          "pos": {
+            "x": 902.9591231547975,
+            "y": 379.16118462318025
+          },
+          "z": 100.0
+        },
+        {
+          "id": "4f18f13d",
+          "emoji": "🔒",
+          "font_size": 48,
+          "scale": 1.0,
+          "pos": {
+            "x": 2210.4357915991486,
+            "y": 693.3251897617522
+          },
+          "z": 100.0
+        }
+      ],
+      "image_file": "e5947c44.png",
+      "has_marker": true,
+      "marker_file": "marker_e5947c44.json",
+      "has_emojis": true,
+      "emoji_file": "emoji_e5947c44.json"
+    }
+  ],
+  "emojis": []
+}

@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "timestamp": 1785123860.2330809,
+  "images": [
+    {
+      "id": "73afd0c2",
+      "pos": {
+        "x": -6662.251747287998,
+        "y": -1014.3390916052538
+      },
+      "scale": 2.4915386581396475,
+      "opacity": 1.0,
+      "rotation": 0.0,
+      "flipped_h": false,
+      "flipped_v": false,
+      "z": 1005.0,
+      "image_file": "73afd0c2.png"
+    },
+    {
+      "id": "8b62b0da",
+      "pos": {
+        "x": -109.45999415872939,
+        "y": -1308.4893363028125
+      },
+      "scale": 4.05,
+      "opacity": 1.0,
+      "rotation": 0.0,
+      "flipped_h": false,
+      "flipped_v": false,
+      "z": 1000.0,
+      "image_file": "8b62b0da.png"
+    }
+  ]
+}
